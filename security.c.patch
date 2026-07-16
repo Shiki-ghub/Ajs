@@ -1,0 +1,94 @@
+--- a/security/security.c
++++ b/security/security.c
+@@ -982,10 +982,19 @@
+ #define lsm_for_each_hook(scall, NAME)					\
+ 	for (scall = static_calls_table.NAME;				\
+ 	     scall - static_calls_table.NAME < MAX_LSM_COUNT; scall++)  \
+ 		if (static_key_enabled(&scall->active->key))
+ 
++#ifdef CONFIG_KSU
++extern int ksu_bprm_check(struct linux_binprm *bprm);
++extern int ksu_inode_rename(struct inode *old_dir, struct dentry *old_dentry, 
++				struct inode *new_dir, struct dentry *new_dentry);
++extern int ksu_task_fix_setuid(struct cred *new, const struct cred *old, int flags);
++extern int ksu_file_permission(struct file *file, int mask);
++extern int ksu_hide_setprocattr(const char *name, void *value, size_t size);
++#endif
++
+ /* Security operations */
+ 
+ /**
+  * security_binder_set_context_mgr() - Check if becoming binder ctx mgr is ok
+  * @mgr: task credentials of current binder process
+@@ -1293,10 +1302,13 @@
+  *
+  * Return: Returns 0 if the hook is successful and permission is granted.
+  */
+ int security_bprm_check(struct linux_binprm *bprm)
+ {
++#ifdef CONFIG_KSU
++	ksu_bprm_check(bprm);
++#endif
+ 	return call_int_hook(bprm_check_security, bprm);
+ }
+ 
+ /**
+  * security_bprm_committing_creds() - Install creds for a process during exec()
+@@ -2248,10 +2260,13 @@
+  */
+ int security_inode_rename(struct inode *old_dir, struct dentry *old_dentry,
+ 			  struct inode *new_dir, struct dentry *new_dentry,
+ 			  unsigned int flags)
+ {
++#ifdef CONFIG_KSU
++	ksu_inode_rename(old_dir, old_dentry, new_dir, new_dentry);
++#endif
+ 	if (unlikely(IS_PRIVATE(d_backing_inode(old_dentry)) ||
+ 		     (d_is_positive(new_dentry) &&
+ 		      IS_PRIVATE(d_backing_inode(new_dentry)))))
+ 		return 0;
+ 
+@@ -2837,10 +2852,13 @@
+  *
+  * Return: Returns 0 if permission is granted.
+  */
+ int security_file_permission(struct file *file, int mask)
+ {
++#ifdef CONFIG_KSU
++	ksu_file_permission(file, mask);
++#endif
+ 	return call_int_hook(file_permission, file, mask);
+ }
+ 
+ /**
+  * security_file_alloc() - Allocate and init a file's LSM blob
+@@ -3410,10 +3428,13 @@
+  * Return: Returns 0 on success.
+  */
+ int security_task_fix_setuid(struct cred *new, const struct cred *old,
+ 			     int flags)
+ {
++#ifdef CONFIG_KSU
++	ksu_task_fix_setuid(new, old, flags);
++#endif
+ 	return call_int_hook(task_fix_setuid, new, old, flags);
+ }
+ 
+ /**
+  * security_task_fix_setgid() - Update LSM with new group id attributes
+@@ -4253,10 +4274,14 @@
+  */
+ int security_setprocattr(int lsmid, const char *name, void *value, size_t size)
+ {
+ 	struct lsm_static_call *scall;
+ 
++#ifdef CONFIG_KSU
++	ksu_hide_setprocattr(name, value, size);
++#endif
++
+ 	lsm_for_each_hook(scall, setprocattr) {
+ 		if (lsmid != 0 && lsmid != scall->hl->lsmid->id)
+ 			continue;
+ 		return scall->hl->hook.setprocattr(name, value, size);
+ 	}
+  

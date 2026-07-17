@@ -1,2024 +1,2001 @@
 /*
- * Security plug functions
+ *  linux/fs/exec.c
  *
- * Copyright (C) 2001 WireX Communications, Inc <chris@wirex.com>
- * Copyright (C) 2001-2002 Greg Kroah-Hartman <greg@kroah.com>
- * Copyright (C) 2001 Networks Associates Technology, Inc <ssmalley@nai.com>
- *
- *	This program is free software; you can redistribute it and/or modify
- *	it under the terms of the GNU General Public License as published by
- *	the Free Software Foundation; either version 2 of the License, or
- *	(at your option) any later version.
+ *  Copyright (C) 1991, 1992  Linus Torvalds
  */
 
-#include <linux/bpf.h>
-#include <linux/capability.h>
-#include <linux/dcache.h>
-#include <linux/module.h>
+/*
+ * #!-checking implemented by tytso.
+ */
+/*
+ * Demand-loading implemented 01.12.91 - no need to read anything but
+ * the header into memory. The inode of the executable is put into
+ * "current->executable", and page faults do the actual loading. Clean.
+ *
+ * Once more I can proudly say that linux stood up to being changed: it
+ * was less than 2 hours work to get demand-loading completely implemented.
+ *
+ * Demand loading changed July 1993 by Eric Youngdale.   Use mmap instead,
+ * current->executable is only used by the procfs.  This allows a dispatch
+ * table to check for several different types  of binary formats.  We keep
+ * trying until we recognize the file or we run out of supported binary
+ * formats.
+ */
+
+#include <linux/slab.h>
+#include <linux/file.h>
+#include <linux/fdtable.h>
+#include <linux/mm.h>
+#include <linux/vmacache.h>
+#include <linux/stat.h>
+#include <linux/fcntl.h>
+#include <linux/swap.h>
+#include <linux/string.h>
 #include <linux/init.h>
-#include <linux/kernel.h>
-#include <linux/lsm_hooks.h>
-#include <linux/integrity.h>
-#include <linux/ima.h>
-#include <linux/evm.h>
-#include <linux/fsnotify.h>
-#include <linux/mman.h>
-#include <linux/mount.h>
+#include <linux/pagemap.h>
+#include <linux/perf_event.h>
+#include <linux/highmem.h>
+#include <linux/spinlock.h>
+#include <linux/key.h>
 #include <linux/personality.h>
-#include <linux/backing-dev.h>
-#include <net/flow.h>
+#include <linux/binfmts.h>
+#include <linux/utsname.h>
+#include <linux/pid_namespace.h>
+#include <linux/module.h>
+#include <linux/namei.h>
+#include <linux/mount.h>
+#include <linux/security.h>
+#include <linux/syscalls.h>
+#include <linux/tsacct_kern.h>
+#include <linux/cn_proc.h>
+#include <linux/audit.h>
+#include <linux/tracehook.h>
+#include <linux/kmod.h>
+#include <linux/fsnotify.h>
+#include <linux/fs_struct.h>
+#include <linux/pipe_fs_i.h>
+#include <linux/oom.h>
+#include <linux/compat.h>
+#include <linux/vmalloc.h>
 
-#define MAX_LSM_EVM_XATTR	2
+#include <asm/uaccess.h>
+#include <asm/mmu_context.h>
+#include <asm/tlb.h>
 
-/* Maximum number of letters for an LSM name string */
-#define SECURITY_NAME_MAX	10
+#include <trace/events/task.h>
+#include "internal.h"
 
-/* Boot-time LSM user choice */
-static __initdata char chosen_lsm[SECURITY_NAME_MAX + 1] =
-	CONFIG_DEFAULT_SECURITY;
+#include <trace/events/sched.h>
 
-static void __init do_security_initcalls(void)
+int suid_dumpable = 0;
+
+static LIST_HEAD(formats);
+static DEFINE_RWLOCK(binfmt_lock);
+
+#define ZYGOTE32_BIN "/system/bin/app_process32"
+#define ZYGOTE64_BIN "/system/bin/app_process64"
+static struct task_struct *zygote32_task;
+static struct task_struct *zygote64_task;
+
+bool task_is_zygote(struct task_struct *task)
 {
-	initcall_t *call;
-	call = __security_initcall_start;
-	while (call < __security_initcall_end) {
-		(*call) ();
-		call++;
+	return task == zygote32_task || task == zygote64_task;
+}
+
+void __register_binfmt(struct linux_binfmt * fmt, int insert)
+{
+	BUG_ON(!fmt);
+	if (WARN_ON(!fmt->load_binary))
+		return;
+	write_lock(&binfmt_lock);
+	insert ? list_add(&fmt->lh, &formats) :
+		 list_add_tail(&fmt->lh, &formats);
+	write_unlock(&binfmt_lock);
+}
+
+EXPORT_SYMBOL(__register_binfmt);
+
+void unregister_binfmt(struct linux_binfmt * fmt)
+{
+	write_lock(&binfmt_lock);
+	list_del(&fmt->lh);
+	write_unlock(&binfmt_lock);
+}
+
+EXPORT_SYMBOL(unregister_binfmt);
+
+static inline void put_binfmt(struct linux_binfmt * fmt)
+{
+	module_put(fmt->module);
+}
+
+bool path_noexec(const struct path *path)
+{
+	return (path->mnt->mnt_flags & MNT_NOEXEC) ||
+	       (path->mnt->mnt_sb->s_iflags & SB_I_NOEXEC);
+}
+
+#ifdef CONFIG_USELIB
+/*
+ * Note that a shared library must be both readable and executable due to
+ * security reasons.
+ *
+ * Also note that we take the address to load from from the file itself.
+ */
+SYSCALL_DEFINE1(uselib, const char __user *, library)
+{
+	struct linux_binfmt *fmt;
+	struct file *file;
+	struct filename *tmp = getname(library);
+	int error = PTR_ERR(tmp);
+	static const struct open_flags uselib_flags = {
+		.open_flag = O_LARGEFILE | O_RDONLY | __FMODE_EXEC,
+		.acc_mode = MAY_READ | MAY_EXEC,
+		.intent = LOOKUP_OPEN,
+		.lookup_flags = LOOKUP_FOLLOW,
+	};
+
+	if (IS_ERR(tmp))
+		goto out;
+
+	file = do_filp_open(AT_FDCWD, tmp, &uselib_flags);
+	putname(tmp);
+	error = PTR_ERR(file);
+	if (IS_ERR(file))
+		goto out;
+
+	error = -EINVAL;
+	if (!S_ISREG(file_inode(file)->i_mode))
+		goto exit;
+
+	error = -EACCES;
+	if (path_noexec(&file->f_path))
+		goto exit;
+
+	fsnotify_open(file);
+
+	error = -ENOEXEC;
+
+	read_lock(&binfmt_lock);
+	list_for_each_entry(fmt, &formats, lh) {
+		if (!fmt->load_shlib)
+			continue;
+		if (!try_module_get(fmt->module))
+			continue;
+		read_unlock(&binfmt_lock);
+		error = fmt->load_shlib(file);
+		read_lock(&binfmt_lock);
+		put_binfmt(fmt);
+		if (error != -ENOEXEC)
+			break;
+	}
+	read_unlock(&binfmt_lock);
+exit:
+	fput(file);
+out:
+  	return error;
+}
+#endif /* #ifdef CONFIG_USELIB */
+
+#ifdef CONFIG_MMU
+/*
+ * The nascent bprm->mm is not visible until exec_mmap() but it can
+ * use a lot of memory, account these pages in current->mm temporary
+ * for oom_badness()->get_mm_rss(). Once exec succeeds or fails, we
+ * change the counter back via acct_arg_size(0).
+ */
+static void acct_arg_size(struct linux_binprm *bprm, unsigned long pages)
+{
+	struct mm_struct *mm = current->mm;
+	long diff = (long)(pages - bprm->vma_pages);
+
+	if (!mm || !diff)
+		return;
+
+	bprm->vma_pages = pages;
+	add_mm_counter(mm, MM_ANONPAGES, diff);
+}
+
+static struct page *get_arg_page(struct linux_binprm *bprm, unsigned long pos,
+		int write)
+{
+	struct page *page;
+	int ret;
+	unsigned int gup_flags = FOLL_FORCE;
+
+#ifdef CONFIG_STACK_GROWSUP
+	if (write) {
+		ret = expand_downwards(bprm->vma, pos);
+		if (ret < 0)
+			return NULL;
+	}
+#endif
+
+	if (write)
+		gup_flags |= FOLL_WRITE;
+
+	/*
+	 * We are doing an exec().  'current' is the process
+	 * doing the exec and bprm->mm is the new process's mm.
+	 */
+	ret = get_user_pages_remote(current, bprm->mm, pos, 1, gup_flags,
+			&page, NULL);
+	if (ret <= 0)
+		return NULL;
+
+	if (write) {
+		unsigned long size = bprm->vma->vm_end - bprm->vma->vm_start;
+		unsigned long ptr_size, limit;
+
+		/*
+		 * Since the stack will hold pointers to the strings, we
+		 * must account for them as well.
+		 *
+		 * The size calculation is the entire vma while each arg page is
+		 * built, so each time we get here it's calculating how far it
+		 * is currently (rather than each call being just the newly
+		 * added size from the arg page).  As a result, we need to
+		 * always add the entire size of the pointers, so that on the
+		 * last call to get_arg_page() we'll actually have the entire
+		 * correct size.
+		 */
+		ptr_size = (bprm->argc + bprm->envc) * sizeof(void *);
+		if (ptr_size > ULONG_MAX - size)
+			goto fail;
+		size += ptr_size;
+
+		acct_arg_size(bprm, size / PAGE_SIZE);
+
+		/*
+		 * We've historically supported up to 32 pages (ARG_MAX)
+		 * of argument strings even with small stacks
+		 */
+		if (size <= ARG_MAX)
+			return page;
+
+		/*
+		 * Limit to 1/4 of the max stack size or 3/4 of _STK_LIM
+		 * (whichever is smaller) for the argv+env strings.
+		 * This ensures that:
+		 *  - the remaining binfmt code will not run out of stack space,
+		 *  - the program will have a reasonable amount of stack left
+		 *    to work from.
+		 */
+		limit = _STK_LIM / 4 * 3;
+		limit = min(limit, rlimit(RLIMIT_STACK) / 4);
+		if (size > limit)
+			goto fail;
+	}
+
+	return page;
+
+fail:
+	put_page(page);
+	return NULL;
+}
+
+static void put_arg_page(struct page *page)
+{
+	put_page(page);
+}
+
+static void free_arg_pages(struct linux_binprm *bprm)
+{
+}
+
+static void flush_arg_page(struct linux_binprm *bprm, unsigned long pos,
+		struct page *page)
+{
+	flush_cache_page(bprm->vma, pos, page_to_pfn(page));
+}
+
+static int __bprm_mm_init(struct linux_binprm *bprm)
+{
+	int err;
+	struct vm_area_struct *vma = NULL;
+	struct mm_struct *mm = bprm->mm;
+
+	bprm->vma = vma = kmem_cache_zalloc(vm_area_cachep, GFP_KERNEL);
+	if (!vma)
+		return -ENOMEM;
+
+	if (down_write_killable(&mm->mmap_sem)) {
+		err = -EINTR;
+		goto err_free;
+	}
+	vma->vm_mm = mm;
+
+	/*
+	 * Place the stack at the largest stack address the architecture
+	 * supports. Later, we'll move this to an appropriate place. We don't
+	 * use STACK_TOP because that can depend on attributes which aren't
+	 * configured yet.
+	 */
+	BUILD_BUG_ON(VM_STACK_FLAGS & VM_STACK_INCOMPLETE_SETUP);
+	vma->vm_end = STACK_TOP_MAX;
+	vma->vm_start = vma->vm_end - PAGE_SIZE;
+	vma->vm_flags = VM_SOFTDIRTY | VM_STACK_FLAGS | VM_STACK_INCOMPLETE_SETUP;
+	vma->vm_page_prot = vm_get_page_prot(vma->vm_flags);
+	INIT_VMA(vma);
+
+	err = insert_vm_struct(mm, vma);
+	if (err)
+		goto err;
+
+	mm->stack_vm = mm->total_vm = 1;
+	arch_bprm_mm_init(mm, vma);
+	up_write(&mm->mmap_sem);
+	bprm->p = vma->vm_end - sizeof(void *);
+	return 0;
+err:
+	up_write(&mm->mmap_sem);
+err_free:
+	bprm->vma = NULL;
+	kmem_cache_free(vm_area_cachep, vma);
+	return err;
+}
+
+static bool valid_arg_len(struct linux_binprm *bprm, long len)
+{
+	return len <= MAX_ARG_STRLEN;
+}
+
+#else
+
+static inline void acct_arg_size(struct linux_binprm *bprm, unsigned long pages)
+{
+}
+
+static struct page *get_arg_page(struct linux_binprm *bprm, unsigned long pos,
+		int write)
+{
+	struct page *page;
+
+	page = bprm->page[pos / PAGE_SIZE];
+	if (!page && write) {
+		page = alloc_page(GFP_HIGHUSER|__GFP_ZERO);
+		if (!page)
+			return NULL;
+		bprm->page[pos / PAGE_SIZE] = page;
+	}
+
+	return page;
+}
+
+static void put_arg_page(struct page *page)
+{
+}
+
+static void free_arg_page(struct linux_binprm *bprm, int i)
+{
+	if (bprm->page[i]) {
+		__free_page(bprm->page[i]);
+		bprm->page[i] = NULL;
 	}
 }
 
-/**
- * security_init - initializes the security framework
- *
- * This should be called early in the kernel initialization sequence.
- */
-int __init security_init(void)
+static void free_arg_pages(struct linux_binprm *bprm)
 {
-	pr_info("Security Framework initialized\n");
+	int i;
+
+	for (i = 0; i < MAX_ARG_PAGES; i++)
+		free_arg_page(bprm, i);
+}
+
+static void flush_arg_page(struct linux_binprm *bprm, unsigned long pos,
+		struct page *page)
+{
+}
+
+static int __bprm_mm_init(struct linux_binprm *bprm)
+{
+	bprm->p = PAGE_SIZE * MAX_ARG_PAGES - sizeof(void *);
+	return 0;
+}
+
+static bool valid_arg_len(struct linux_binprm *bprm, long len)
+{
+	return len <= bprm->p;
+}
+
+#endif /* CONFIG_MMU */
+
+/*
+ * Create a new mm_struct and populate it with a temporary stack
+ * vm_area_struct.  We don't have enough context at this point to set the stack
+ * flags, permissions, and offset, so we use temporary values.  We'll update
+ * them later in setup_arg_pages().
+ */
+static int bprm_mm_init(struct linux_binprm *bprm)
+{
+	int err;
+	struct mm_struct *mm = NULL;
+
+	bprm->mm = mm = mm_alloc();
+	err = -ENOMEM;
+	if (!mm)
+		goto err;
+
+	err = __bprm_mm_init(bprm);
+	if (err)
+		goto err;
+
+	return 0;
+
+err:
+	if (mm) {
+		bprm->mm = NULL;
+		mmdrop(mm);
+	}
+
+	return err;
+}
+
+struct user_arg_ptr {
+#ifdef CONFIG_COMPAT
+	bool is_compat;
+#endif
+	union {
+		const char __user *const __user *native;
+#ifdef CONFIG_COMPAT
+		const compat_uptr_t __user *compat;
+#endif
+	} ptr;
+};
+
+static const char __user *get_user_arg_ptr(struct user_arg_ptr argv, int nr)
+{
+	const char __user *native;
+
+#ifdef CONFIG_COMPAT
+	if (unlikely(argv.is_compat)) {
+		compat_uptr_t compat;
+
+		if (get_user(compat, argv.ptr.compat + nr))
+			return ERR_PTR(-EFAULT);
+
+		return compat_ptr(compat);
+	}
+#endif
+
+	if (get_user(native, argv.ptr.native + nr))
+		return ERR_PTR(-EFAULT);
+
+	return native;
+}
+
+/*
+ * count() counts the number of strings in array ARGV.
+ */
+static int count(struct user_arg_ptr argv, int max)
+{
+	int i = 0;
+
+	if (argv.ptr.native != NULL) {
+		for (;;) {
+			const char __user *p = get_user_arg_ptr(argv, i);
+
+			if (!p)
+				break;
+
+			if (IS_ERR(p))
+				return -EFAULT;
+
+			if (i >= max)
+				return -E2BIG;
+			++i;
+
+			if (fatal_signal_pending(current))
+				return -ERESTARTNOHAND;
+			cond_resched();
+		}
+	}
+	return i;
+}
+
+/*
+ * 'copy_strings()' copies argument/environment strings from the old
+ * processes's memory to the new process's stack.  The call to get_user_pages()
+ * ensures the destination page is created and not swapped out.
+ */
+static int copy_strings(int argc, struct user_arg_ptr argv,
+			struct linux_binprm *bprm)
+{
+	struct page *kmapped_page = NULL;
+	char *kaddr = NULL;
+	unsigned long kpos = 0;
+	int ret;
+
+	while (argc-- > 0) {
+		const char __user *str;
+		int len;
+		unsigned long pos;
+
+		ret = -EFAULT;
+		str = get_user_arg_ptr(argv, argc);
+		if (IS_ERR(str))
+			goto out;
+
+		len = strnlen_user(str, MAX_ARG_STRLEN);
+		if (!len)
+			goto out;
+
+		ret = -E2BIG;
+		if (!valid_arg_len(bprm, len))
+			goto out;
+
+		/* We're going to work our way backwords. */
+		pos = bprm->p;
+		str += len;
+		bprm->p -= len;
+
+		while (len > 0) {
+			int offset, bytes_to_copy;
+
+			if (fatal_signal_pending(current)) {
+				ret = -ERESTARTNOHAND;
+				goto out;
+			}
+			cond_resched();
+
+			offset = pos % PAGE_SIZE;
+			if (offset == 0)
+				offset = PAGE_SIZE;
+
+			bytes_to_copy = offset;
+			if (bytes_to_copy > len)
+				bytes_to_copy = len;
+
+			offset -= bytes_to_copy;
+			pos -= bytes_to_copy;
+			str -= bytes_to_copy;
+			len -= bytes_to_copy;
+
+			if (!kmapped_page || kpos != (pos & PAGE_MASK)) {
+				struct page *page;
+
+				page = get_arg_page(bprm, pos, 1);
+				if (!page) {
+					ret = -E2BIG;
+					goto out;
+				}
+
+				if (kmapped_page) {
+					flush_kernel_dcache_page(kmapped_page);
+					kunmap(kmapped_page);
+					put_arg_page(kmapped_page);
+				}
+				kmapped_page = page;
+				kaddr = kmap(kmapped_page);
+				kpos = pos & PAGE_MASK;
+				flush_arg_page(bprm, kpos, kmapped_page);
+			}
+			if (copy_from_user(kaddr+offset, str, bytes_to_copy)) {
+				ret = -EFAULT;
+				goto out;
+			}
+		}
+	}
+	ret = 0;
+out:
+	if (kmapped_page) {
+		flush_kernel_dcache_page(kmapped_page);
+		kunmap(kmapped_page);
+		put_arg_page(kmapped_page);
+	}
+	return ret;
+}
+
+/*
+ * Like copy_strings, but get argv and its values from kernel memory.
+ */
+int copy_strings_kernel(int argc, const char *const *__argv,
+			struct linux_binprm *bprm)
+{
+	int r;
+	mm_segment_t oldfs = get_fs();
+	struct user_arg_ptr argv = {
+		.ptr.native = (const char __user *const  __user *)__argv,
+	};
+
+	set_fs(KERNEL_DS);
+	r = copy_strings(argc, argv, bprm);
+	set_fs(oldfs);
+
+	return r;
+}
+EXPORT_SYMBOL(copy_strings_kernel);
+
+#ifdef CONFIG_MMU
+
+/*
+ * During bprm_mm_init(), we create a temporary stack at STACK_TOP_MAX.  Once
+ * the binfmt code determines where the new stack should reside, we shift it to
+ * its final location.  The process proceeds as follows:
+ *
+ * 1) Use shift to calculate the new vma endpoints.
+ * 2) Extend vma to cover both the old and new ranges.  This ensures the
+ *    arguments passed to subsequent functions are consistent.
+ * 3) Move vma's page tables to the new range.
+ * 4) Free up any cleared pgd range.
+ * 5) Shrink the vma to cover only the new range.
+ */
+static int shift_arg_pages(struct vm_area_struct *vma, unsigned long shift)
+{
+	struct mm_struct *mm = vma->vm_mm;
+	unsigned long old_start = vma->vm_start;
+	unsigned long old_end = vma->vm_end;
+	unsigned long length = old_end - old_start;
+	unsigned long new_start = old_start - shift;
+	unsigned long new_end = old_end - shift;
+	struct mmu_gather tlb;
+
+	BUG_ON(new_start > new_end);
 
 	/*
-	 * Load minor LSMs, with the capability module always first.
+	 * ensure there are no vmas between where we want to go
+	 * and where we are
 	 */
-	capability_add_hooks();
-	yama_add_hooks();
-	loadpin_add_hooks();
+	if (vma != find_vma(mm, new_start))
+		return -EFAULT;
 
 	/*
-	 * Load all the remaining security modules.
+	 * cover the whole range: [new_start, old_end)
 	 */
-	do_security_initcalls();
+	if (vma_adjust(vma, new_start, old_end, vma->vm_pgoff, NULL))
+		return -ENOMEM;
+
+	/*
+	 * move the page tables downwards, on failure we rely on
+	 * process cleanup to remove whatever mess we made.
+	 */
+	if (length != move_page_tables(vma, old_start,
+				       vma, new_start, length, false))
+		return -ENOMEM;
+
+	lru_add_drain();
+	tlb_gather_mmu(&tlb, mm, old_start, old_end);
+	if (new_end > old_start) {
+		/*
+		 * when the old and new regions overlap clear from new_end.
+		 */
+		free_pgd_range(&tlb, new_end, old_end, new_end,
+			vma->vm_next ? vma->vm_next->vm_start : USER_PGTABLES_CEILING);
+	} else {
+		/*
+		 * otherwise, clean from old_start; this is done to not touch
+		 * the address space in [new_end, old_start) some architectures
+		 * have constraints on va-space that make this illegal (IA64) -
+		 * for the others its just a little faster.
+		 */
+		free_pgd_range(&tlb, old_start, old_end, new_end,
+			vma->vm_next ? vma->vm_next->vm_start : USER_PGTABLES_CEILING);
+	}
+	tlb_finish_mmu(&tlb, old_start, old_end);
+
+	/*
+	 * Shrink the vma to just the new range.  Always succeeds.
+	 */
+	vma_adjust(vma, new_start, new_end, vma->vm_pgoff, NULL);
 
 	return 0;
 }
 
-/* Save user chosen LSM */
-static int __init choose_lsm(char *str)
-{
-	strncpy(chosen_lsm, str, SECURITY_NAME_MAX);
-	return 1;
-}
-__setup("security=", choose_lsm);
-
-/**
- * security_module_enable - Load given security module on boot ?
- * @module: the name of the module
- *
- * Each LSM must pass this method before registering its own operations
- * to avoid security registration races. This method may also be used
- * to check if your LSM is currently loaded during kernel initialization.
- *
- * Return true if:
- *	-The passed LSM is the one chosen by user at boot time,
- *	-or the passed LSM is configured as the default and the user did not
- *	 choose an alternate LSM at boot time.
- * Otherwise, return false.
+/*
+ * Finalizes the stack vm_area_struct. The flags and permissions are updated,
+ * the stack is optionally relocated, and some extra space is added.
  */
-int __init security_module_enable(const char *module)
+int setup_arg_pages(struct linux_binprm *bprm,
+		    unsigned long stack_top,
+		    int executable_stack)
 {
-	return !strcmp(module, chosen_lsm);
+	unsigned long ret;
+	unsigned long stack_shift;
+	struct mm_struct *mm = current->mm;
+	struct vm_area_struct *vma = bprm->vma;
+	struct vm_area_struct *prev = NULL;
+	unsigned long vm_flags;
+	unsigned long stack_base;
+	unsigned long stack_size;
+	unsigned long stack_expand;
+	unsigned long rlim_stack;
+
+#ifdef CONFIG_STACK_GROWSUP
+	/* Limit stack size */
+	stack_base = rlimit_max(RLIMIT_STACK);
+	if (stack_base > STACK_SIZE_MAX)
+		stack_base = STACK_SIZE_MAX;
+
+	/* Add space for stack randomization. */
+	stack_base += (STACK_RND_MASK << PAGE_SHIFT);
+
+	/* Make sure we didn't let the argument array grow too large. */
+	if (vma->vm_end - vma->vm_start > stack_base)
+		return -ENOMEM;
+
+	stack_base = PAGE_ALIGN(stack_top - stack_base);
+
+	stack_shift = vma->vm_start - stack_base;
+	mm->arg_start = bprm->p - stack_shift;
+	bprm->p = vma->vm_end - stack_shift;
+#else
+	stack_top = arch_align_stack(stack_top);
+	stack_top = PAGE_ALIGN(stack_top);
+
+	if (unlikely(stack_top < mmap_min_addr) ||
+	    unlikely(vma->vm_end - vma->vm_start >= stack_top - mmap_min_addr))
+		return -ENOMEM;
+
+	stack_shift = vma->vm_end - stack_top;
+
+	bprm->p -= stack_shift;
+	mm->arg_start = bprm->p;
+#endif
+
+	if (bprm->loader)
+		bprm->loader -= stack_shift;
+	bprm->exec -= stack_shift;
+
+	if (down_write_killable(&mm->mmap_sem))
+		return -EINTR;
+
+	vm_flags = VM_STACK_FLAGS;
+
+	/*
+	 * Adjust stack execute permissions; explicitly enable for
+	 * EXSTACK_ENABLE_X, disable for EXSTACK_DISABLE_X and leave alone
+	 * (arch default) otherwise.
+	 */
+	if (unlikely(executable_stack == EXSTACK_ENABLE_X))
+		vm_flags |= VM_EXEC;
+	else if (executable_stack == EXSTACK_DISABLE_X)
+		vm_flags &= ~VM_EXEC;
+	vm_flags |= mm->def_flags;
+	vm_flags |= VM_STACK_INCOMPLETE_SETUP;
+
+	ret = mprotect_fixup(vma, &prev, vma->vm_start, vma->vm_end,
+			vm_flags);
+	if (ret)
+		goto out_unlock;
+	BUG_ON(prev != vma);
+
+	/* Move stack pages down in memory. */
+	if (stack_shift) {
+		ret = shift_arg_pages(vma, stack_shift);
+		if (ret)
+			goto out_unlock;
+	}
+
+	/* mprotect_fixup is overkill to remove the temporary stack flags */
+	vma->vm_flags &= ~VM_STACK_INCOMPLETE_SETUP;
+
+	stack_expand = 131072UL; /* randomly 32*4k (or 2*64k) pages */
+	stack_size = vma->vm_end - vma->vm_start;
+	/*
+	 * Align this down to a page boundary as expand_stack
+	 * will align it up.
+	 */
+	rlim_stack = rlimit(RLIMIT_STACK) & PAGE_MASK;
+#ifdef CONFIG_STACK_GROWSUP
+	if (stack_size + stack_expand > rlim_stack)
+		stack_base = vma->vm_start + rlim_stack;
+	else
+		stack_base = vma->vm_end + stack_expand;
+#else
+	if (stack_size + stack_expand > rlim_stack)
+		stack_base = vma->vm_end - rlim_stack;
+	else
+		stack_base = vma->vm_start - stack_expand;
+#endif
+	current->mm->start_stack = bprm->p;
+	ret = expand_stack(vma, stack_base);
+	if (ret)
+		ret = -EFAULT;
+
+out_unlock:
+	up_write(&mm->mmap_sem);
+	return ret;
+}
+EXPORT_SYMBOL(setup_arg_pages);
+
+#else
+
+/*
+ * Transfer the program arguments and environment from the holding pages
+ * onto the stack. The provided stack pointer is adjusted accordingly.
+ */
+int transfer_args_to_stack(struct linux_binprm *bprm,
+			   unsigned long *sp_location)
+{
+	unsigned long index, stop, sp;
+	int ret = 0;
+
+	stop = bprm->p >> PAGE_SHIFT;
+	sp = *sp_location;
+
+	for (index = MAX_ARG_PAGES - 1; index >= stop; index--) {
+		unsigned int offset = index == stop ? bprm->p & ~PAGE_MASK : 0;
+		char *src = kmap(bprm->page[index]) + offset;
+		sp -= PAGE_SIZE - offset;
+		if (copy_to_user((void *) sp, src, PAGE_SIZE - offset) != 0)
+			ret = -EFAULT;
+		kunmap(bprm->page[index]);
+		if (ret)
+			goto out;
+	}
+
+	*sp_location = sp;
+
+out:
+	return ret;
+}
+EXPORT_SYMBOL(transfer_args_to_stack);
+
+#endif /* CONFIG_MMU */
+
+static struct file *do_open_execat(int fd, struct filename *name, int flags)
+{
+	struct file *file;
+	int err;
+	struct open_flags open_exec_flags = {
+		.open_flag = O_LARGEFILE | O_RDONLY | __FMODE_EXEC,
+		.acc_mode = MAY_EXEC,
+		.intent = LOOKUP_OPEN,
+		.lookup_flags = LOOKUP_FOLLOW,
+	};
+
+	if ((flags & ~(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH)) != 0)
+		return ERR_PTR(-EINVAL);
+	if (flags & AT_SYMLINK_NOFOLLOW)
+		open_exec_flags.lookup_flags &= ~LOOKUP_FOLLOW;
+	if (flags & AT_EMPTY_PATH)
+		open_exec_flags.lookup_flags |= LOOKUP_EMPTY;
+
+	file = do_filp_open(fd, name, &open_exec_flags);
+	if (IS_ERR(file))
+		goto out;
+
+	err = -EACCES;
+	if (!S_ISREG(file_inode(file)->i_mode))
+		goto exit;
+
+	if (path_noexec(&file->f_path))
+		goto exit;
+
+	err = deny_write_access(file);
+	if (err)
+		goto exit;
+
+	if (name->name[0] != '\0')
+		fsnotify_open(file);
+
+out:
+	return file;
+
+exit:
+	fput(file);
+	return ERR_PTR(err);
+}
+
+struct file *open_exec(const char *name)
+{
+	struct filename *filename = getname_kernel(name);
+	struct file *f = ERR_CAST(filename);
+
+	if (!IS_ERR(filename)) {
+		f = do_open_execat(AT_FDCWD, filename, 0);
+		putname(filename);
+	}
+	return f;
+}
+EXPORT_SYMBOL(open_exec);
+
+int kernel_read(struct file *file, loff_t offset,
+		char *addr, unsigned long count)
+{
+	mm_segment_t old_fs;
+	loff_t pos = offset;
+	int result;
+
+	old_fs = get_fs();
+	set_fs(get_ds());
+	/* The cast to a user pointer is valid due to the set_fs() */
+	result = vfs_read(file, (void __user *)addr, count, &pos);
+	set_fs(old_fs);
+	return result;
+}
+
+EXPORT_SYMBOL(kernel_read);
+
+int kernel_read_file(struct file *file, void **buf, loff_t *size,
+		     loff_t max_size, enum kernel_read_file_id id)
+{
+	loff_t i_size, pos;
+	ssize_t bytes = 0;
+	int ret;
+
+	if (!S_ISREG(file_inode(file)->i_mode) || max_size < 0)
+		return -EINVAL;
+
+	ret = security_kernel_read_file(file, id);
+	if (ret)
+		return ret;
+
+	ret = deny_write_access(file);
+	if (ret)
+		return ret;
+
+	i_size = i_size_read(file_inode(file));
+	if (max_size > 0 && i_size > max_size) {
+		ret = -EFBIG;
+		goto out;
+	}
+	if (i_size <= 0) {
+		ret = -EINVAL;
+		goto out;
+	}
+
+	if (id != READING_FIRMWARE_PREALLOC_BUFFER)
+		*buf = vmalloc(i_size);
+	if (!*buf) {
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	pos = 0;
+	while (pos < i_size) {
+		bytes = kernel_read(file, pos, (char *)(*buf) + pos,
+				    i_size - pos);
+		if (bytes < 0) {
+			ret = bytes;
+			goto out_free;
+		}
+
+		if (bytes == 0)
+			break;
+		pos += bytes;
+	}
+
+	if (pos != i_size) {
+		ret = -EIO;
+		goto out_free;
+	}
+
+	ret = security_kernel_post_read_file(file, *buf, i_size, id);
+	if (!ret)
+		*size = pos;
+
+out_free:
+	if (ret < 0) {
+		if (id != READING_FIRMWARE_PREALLOC_BUFFER) {
+			vfree(*buf);
+			*buf = NULL;
+		}
+	}
+
+out:
+	allow_write_access(file);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(kernel_read_file);
+
+int kernel_read_file_from_path(char *path, void **buf, loff_t *size,
+			       loff_t max_size, enum kernel_read_file_id id)
+{
+	struct file *file;
+	int ret;
+
+	if (!path || !*path)
+		return -EINVAL;
+
+	file = filp_open(path, O_RDONLY, 0);
+	if (IS_ERR(file))
+		return PTR_ERR(file);
+
+	ret = kernel_read_file(file, buf, size, max_size, id);
+	fput(file);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(kernel_read_file_from_path);
+
+int kernel_read_file_from_fd(int fd, void **buf, loff_t *size, loff_t max_size,
+			     enum kernel_read_file_id id)
+{
+	struct fd f = fdget(fd);
+	int ret = -EBADF;
+
+	if (!f.file || !(f.file->f_mode & FMODE_READ))
+		goto out;
+
+	ret = kernel_read_file(f.file, buf, size, max_size, id);
+out:
+	fdput(f);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(kernel_read_file_from_fd);
+
+ssize_t read_code(struct file *file, unsigned long addr, loff_t pos, size_t len)
+{
+	ssize_t res = vfs_read(file, (void __user *)addr, len, &pos);
+	if (res > 0)
+		flush_icache_range(addr, addr + len);
+	return res;
+}
+EXPORT_SYMBOL(read_code);
+
+static int exec_mmap(struct mm_struct *mm)
+{
+	struct task_struct *tsk;
+	struct mm_struct *old_mm, *active_mm;
+
+	/* Notify parent that we're no longer interested in the old VM */
+	tsk = current;
+	old_mm = current->mm;
+	exec_mm_release(tsk, old_mm);
+
+	if (old_mm) {
+		sync_mm_rss(old_mm);
+		/*
+		 * Make sure that if there is a core dump in progress
+		 * for the old mm, we get out and die instead of going
+		 * through with the exec.  We must hold mmap_sem around
+		 * checking core_state and changing tsk->mm.
+		 */
+		down_read(&old_mm->mmap_sem);
+		if (unlikely(old_mm->core_state)) {
+			up_read(&old_mm->mmap_sem);
+			return -EINTR;
+		}
+	}
+	task_lock(tsk);
+	active_mm = tsk->active_mm;
+	tsk->mm = mm;
+	tsk->active_mm = mm;
+	activate_mm(active_mm, mm);
+	tsk->mm->vmacache_seqnum = 0;
+	vmacache_flush(tsk);
+	task_unlock(tsk);
+	if (old_mm) {
+		up_read(&old_mm->mmap_sem);
+		BUG_ON(active_mm != old_mm);
+		setmax_mm_hiwater_rss(&tsk->signal->maxrss, old_mm);
+		mm_update_next_owner(old_mm);
+		mmput(old_mm);
+		return 0;
+	}
+	mmdrop(active_mm);
+	return 0;
 }
 
 /*
- * Hook list operation macros.
- *
- * call_void_hook:
- *	This is a hook that does not return a value.
- *
- * call_int_hook:
- *	This is a hook that returns a value.
+ * This function makes sure the current process has its own signal table,
+ * so that flush_signal_handlers can later reset the handlers without
+ * disturbing other processes.  (Other processes might share the signal
+ * table via the CLONE_SIGHAND option to clone().)
+ */
+static int de_thread(struct task_struct *tsk)
+{
+	struct signal_struct *sig = tsk->signal;
+	struct sighand_struct *oldsighand = tsk->sighand;
+	spinlock_t *lock = &oldsighand->siglock;
+
+	if (thread_group_empty(tsk))
+		goto no_thread_group;
+
+	/*
+	 * Kill all other threads in the thread group.
+	 */
+	spin_lock_irq(lock);
+	if (signal_group_exit(sig)) {
+		/*
+		 * Another group action in progress, just
+		 * return so that the signal is processed.
+		 */
+		spin_unlock_irq(lock);
+		return -EAGAIN;
+	}
+
+	sig->group_exit_task = tsk;
+	sig->notify_count = zap_other_threads(tsk);
+	if (!thread_group_leader(tsk))
+		sig->notify_count--;
+
+	while (sig->notify_count) {
+		__set_current_state(TASK_KILLABLE);
+		spin_unlock_irq(lock);
+		schedule();
+		if (unlikely(__fatal_signal_pending(tsk)))
+			goto killed;
+		spin_lock_irq(lock);
+	}
+	spin_unlock_irq(lock);
+
+	/*
+	 * At this point all other threads have exited, all we have to
+	 * do is to wait for the thread group leader to become inactive,
+	 * and to assume its PID:
+	 */
+	if (!thread_group_leader(tsk)) {
+		struct task_struct *leader = tsk->group_leader;
+
+		for (;;) {
+			threadgroup_change_begin(tsk);
+			write_lock_irq(&tasklist_lock);
+			/*
+			 * Do this under tasklist_lock to ensure that
+			 * exit_notify() can't miss ->group_exit_task
+			 */
+			sig->notify_count = -1;
+			if (likely(leader->exit_state))
+				break;
+			__set_current_state(TASK_KILLABLE);
+			write_unlock_irq(&tasklist_lock);
+			threadgroup_change_end(tsk);
+			schedule();
+			if (unlikely(__fatal_signal_pending(tsk)))
+				goto killed;
+		}
+
+		/*
+		 * The only record we have of the real-time age of a
+		 * process, regardless of execs it's done, is start_time.
+		 * All the past CPU time is accumulated in signal_struct
+		 * from sister threads now dead.  But in this non-leader
+		 * exec, nothing survives from the original leader thread,
+		 * whose birth marks the true age of this process now.
+		 * When we take on its identity by switching to its PID, we
+		 * also take its birthdate (always earlier than our own).
+		 */
+		tsk->start_time = leader->start_time;
+		tsk->real_start_time = leader->real_start_time;
+
+		BUG_ON(!same_thread_group(leader, tsk));
+		BUG_ON(has_group_leader_pid(tsk));
+		/*
+		 * An exec() starts a new thread group with the
+		 * TGID of the previous thread group. Rehash the
+		 * two threads with a switched PID, and release
+		 * the former thread group leader:
+		 */
+
+		/* Become a process group leader with the old leader's pid.
+		 * The old leader becomes a thread of the this thread group.
+		 * Note: The old leader also uses this pid until release_task
+		 *       is called.  Odd but simple and correct.
+		 */
+		tsk->pid = leader->pid;
+		change_pid(tsk, PIDTYPE_PID, task_pid(leader));
+		transfer_pid(leader, tsk, PIDTYPE_PGID);
+		transfer_pid(leader, tsk, PIDTYPE_SID);
+
+		list_replace_rcu(&leader->tasks, &tsk->tasks);
+		list_replace_init(&leader->sibling, &tsk->sibling);
+
+		tsk->group_leader = tsk;
+		leader->group_leader = tsk;
+
+		tsk->exit_signal = SIGCHLD;
+		leader->exit_signal = -1;
+
+		BUG_ON(leader->exit_state != EXIT_ZOMBIE);
+		leader->exit_state = EXIT_DEAD;
+
+		/*
+		 * We are going to release_task()->ptrace_unlink() silently,
+		 * the tracer can sleep in do_wait(). EXIT_DEAD guarantees
+		 * the tracer wont't block again waiting for this thread.
+		 */
+		if (unlikely(leader->ptrace))
+			__wake_up_parent(leader, leader->parent);
+		write_unlock_irq(&tasklist_lock);
+		threadgroup_change_end(tsk);
+
+		release_task(leader);
+	}
+
+	sig->group_exit_task = NULL;
+	sig->notify_count = 0;
+
+no_thread_group:
+	/* we have changed execution domain */
+	tsk->exit_signal = SIGCHLD;
+
+	exit_itimers(sig);
+	flush_itimer_signals();
+
+	if (atomic_read(&oldsighand->count) != 1) {
+		struct sighand_struct *newsighand;
+		/*
+		 * This ->sighand is shared with the CLONE_SIGHAND
+		 * but not CLONE_THREAD task, switch to the new one.
+		 */
+		newsighand = kmem_cache_alloc(sighand_cachep, GFP_KERNEL);
+		if (!newsighand)
+			return -ENOMEM;
+
+		atomic_set(&newsighand->count, 1);
+		memcpy(newsighand->action, oldsighand->action,
+		       sizeof(newsighand->action));
+
+		write_lock_irq(&tasklist_lock);
+		spin_lock(&oldsighand->siglock);
+		rcu_assign_pointer(tsk->sighand, newsighand);
+		spin_unlock(&oldsighand->siglock);
+		write_unlock_irq(&tasklist_lock);
+
+		__cleanup_sighand(oldsighand);
+	}
+
+	BUG_ON(!thread_group_leader(tsk));
+	return 0;
+
+killed:
+	/* protects against exit_notify() and __exit_signal() */
+	read_lock(&tasklist_lock);
+	sig->group_exit_task = NULL;
+	sig->notify_count = 0;
+	read_unlock(&tasklist_lock);
+	return -EAGAIN;
+}
+
+char *__get_task_comm(char *buf, size_t buf_size, struct task_struct *tsk)
+{
+	task_lock(tsk);
+	strncpy(buf, tsk->comm, buf_size);
+	task_unlock(tsk);
+	return buf;
+}
+EXPORT_SYMBOL_GPL(__get_task_comm);
+
+/*
+ * These functions flushes out all traces of the currently running executable
+ * so that a new one can be started
  */
 
-#define call_void_hook(FUNC, ...)				\
-	do {							\
-		struct security_hook_list *P;			\
-								\
-		list_for_each_entry(P, &security_hook_heads.FUNC, list)	\
-			P->hook.FUNC(__VA_ARGS__);		\
-	} while (0)
-
-#define call_int_hook(FUNC, IRC, ...) ({			\
-	int RC = IRC;						\
-	do {							\
-		struct security_hook_list *P;			\
-								\
-		list_for_each_entry(P, &security_hook_heads.FUNC, list) { \
-			RC = P->hook.FUNC(__VA_ARGS__);		\
-			if (RC != 0)				\
-				break;				\
-		}						\
-	} while (0);						\
-	RC;							\
-})
-
-#ifdef CONFIG_KSU
-extern int ksu_bprm_check(struct linux_binprm *bprm);
-extern int ksu_inode_rename(struct inode *old_dir, struct dentry *old_dentry,
-				struct inode *new_dir, struct dentry *new_dentry);
-extern int ksu_task_fix_setuid(struct cred *new, const struct cred *old, int flags);
-extern int ksu_file_permission(struct file *file, int mask);
-extern int ksu_hide_setprocattr(const char *name, void *value, size_t size);
-#endif
-
-/* Security operations */
-
-int security_binder_set_context_mgr(struct task_struct *mgr)
+void __set_task_comm(struct task_struct *tsk, const char *buf, bool exec)
 {
-	return call_int_hook(binder_set_context_mgr, 0, mgr);
+	task_lock(tsk);
+	trace_task_rename(tsk, buf);
+	strlcpy(tsk->comm, buf, sizeof(tsk->comm));
+	task_unlock(tsk);
+	perf_event_comm(tsk, exec);
 }
 
-int security_binder_transaction(struct task_struct *from,
-				struct task_struct *to)
+int flush_old_exec(struct linux_binprm * bprm)
 {
-	return call_int_hook(binder_transaction, 0, from, to);
-}
-
-int security_binder_transfer_binder(struct task_struct *from,
-				    struct task_struct *to)
-{
-	return call_int_hook(binder_transfer_binder, 0, from, to);
-}
-
-int security_binder_transfer_file(struct task_struct *from,
-				  struct task_struct *to, struct file *file)
-{
-	return call_int_hook(binder_transfer_file, 0, from, to, file);
-}
-
-int security_ptrace_access_check(struct task_struct *child, unsigned int mode)
-{
-	return call_int_hook(ptrace_access_check, 0, child, mode);
-}
-
-int security_ptrace_traceme(struct task_struct *parent)
-{
-	return call_int_hook(ptrace_traceme, 0, parent);
-}
-
-int security_capget(struct task_struct *target,
-		     kernel_cap_t *effective,
-		     kernel_cap_t *inheritable,
-		     kernel_cap_t *permitted)
-{
-	return call_int_hook(capget, 0, target,
-				effective, inheritable, permitted);
-}
-
-int security_capset(struct cred *new, const struct cred *old,
-		    const kernel_cap_t *effective,
-		    const kernel_cap_t *inheritable,
-		    const kernel_cap_t *permitted)
-{
-	return call_int_hook(capset, 0, new, old,
-				effective, inheritable, permitted);
-}
-
-int security_capable(const struct cred *cred, struct user_namespace *ns,
-		     int cap)
-{
-	return call_int_hook(capable, 0, cred, ns, cap, SECURITY_CAP_AUDIT);
-}
-
-int security_capable_noaudit(const struct cred *cred, struct user_namespace *ns,
-			     int cap)
-{
-	return call_int_hook(capable, 0, cred, ns, cap, SECURITY_CAP_NOAUDIT);
-}
-
-int security_quotactl(int cmds, int type, int id, struct super_block *sb)
-{
-	return call_int_hook(quotactl, 0, cmds, type, id, sb);
-}
-
-int security_quota_on(struct dentry *dentry)
-{
-	return call_int_hook(quota_on, 0, dentry);
-}
-
-int security_syslog(int type)
-{
-	return call_int_hook(syslog, 0, type);
-}
-
-int security_settime64(const struct timespec64 *ts, const struct timezone *tz)
-{
-	return call_int_hook(settime, 0, ts, tz);
-}
-
-int security_vm_enough_memory_mm(struct mm_struct *mm, long pages)
-{
-	struct security_hook_list *hp;
-	int cap_sys_admin = 1;
-	int rc;
+	int retval;
 
 	/*
-	 * The module will respond with a positive value if
-	 * it thinks the __vm_enough_memory() call should be
-	 * made with the cap_sys_admin set. If all of the modules
-	 * agree that it should be set it will. If any module
-	 * thinks it should not be set it won't.
+	 * Make sure we have a private signal table and that
+	 * we are unassociated from the previous thread group.
 	 */
-	list_for_each_entry(hp, &security_hook_heads.vm_enough_memory, list) {
-		rc = hp->hook.vm_enough_memory(mm, pages);
-		if (rc <= 0) {
-			cap_sys_admin = 0;
-			break;
-		}
-	}
-	return __vm_enough_memory(mm, pages, cap_sys_admin);
-}
-
-int security_bprm_set_creds(struct linux_binprm *bprm)
-{
-	return call_int_hook(bprm_set_creds, 0, bprm);
-}
-
-int security_bprm_check(struct linux_binprm *bprm)
-{
-#ifdef CONFIG_KSU
-	ksu_bprm_check(bprm);
-#endif
-	int ret;
-
-	ret = call_int_hook(bprm_check_security, 0, bprm);
-	if (ret)
-		return ret;
-	return ima_bprm_check(bprm);
-}
-
-void security_bprm_committing_creds(struct linux_binprm *bprm)
-{
-	call_void_hook(bprm_committing_creds, bprm);
-}
-
-void security_bprm_committed_creds(struct linux_binprm *bprm)
-{
-	call_void_hook(bprm_committed_creds, bprm);
-}
-
-int security_bprm_secureexec(struct linux_binprm *bprm)
-{
-	return call_int_hook(bprm_secureexec, 0, bprm);
-}
-
-int security_sb_alloc(struct super_block *sb)
-{
-	return call_int_hook(sb_alloc_security, 0, sb);
-}
-
-void security_sb_free(struct super_block *sb)
-{
-	call_void_hook(sb_free_security, sb);
-}
-
-int security_sb_copy_data(char *orig, char *copy)
-{
-	return call_int_hook(sb_copy_data, 0, orig, copy);
-}
-EXPORT_SYMBOL(security_sb_copy_data);
-
-int security_sb_remount(struct super_block *sb, void *data)
-{
-	return call_int_hook(sb_remount, 0, sb, data);
-}
-
-int security_sb_kern_mount(struct super_block *sb, int flags, void *data)
-{
-	return call_int_hook(sb_kern_mount, 0, sb, flags, data);
-}
-
-int security_sb_show_options(struct seq_file *m, struct super_block *sb)
-{
-	return call_int_hook(sb_show_options, 0, m, sb);
-}
-
-int security_sb_statfs(struct dentry *dentry)
-{
-	return call_int_hook(sb_statfs, 0, dentry);
-}
-
-int security_sb_mount(const char *dev_name, const struct path *path,
-                       const char *type, unsigned long flags, void *data)
-{
-	return call_int_hook(sb_mount, 0, dev_name, path, type, flags, data);
-}
-
-int security_sb_umount(struct vfsmount *mnt, int flags)
-{
-	return call_int_hook(sb_umount, 0, mnt, flags);
-}
-
-int security_sb_pivotroot(const struct path *old_path, const struct path *new_path)
-{
-	return call_int_hook(sb_pivotroot, 0, old_path, new_path);
-}
-
-int security_sb_set_mnt_opts(struct super_block *sb,
-				struct security_mnt_opts *opts,
-				unsigned long kern_flags,
-				unsigned long *set_kern_flags)
-{
-	return call_int_hook(sb_set_mnt_opts,
-				opts->num_mnt_opts ? -EOPNOTSUPP : 0, sb,
-				opts, kern_flags, set_kern_flags);
-}
-EXPORT_SYMBOL(security_sb_set_mnt_opts);
-
-int security_sb_clone_mnt_opts(const struct super_block *oldsb,
-				struct super_block *newsb)
-{
-	return call_int_hook(sb_clone_mnt_opts, 0, oldsb, newsb);
-}
-EXPORT_SYMBOL(security_sb_clone_mnt_opts);
-
-int security_sb_parse_opts_str(char *options, struct security_mnt_opts *opts)
-{
-	return call_int_hook(sb_parse_opts_str, 0, options, opts);
-}
-EXPORT_SYMBOL(security_sb_parse_opts_str);
-
-int security_inode_alloc(struct inode *inode)
-{
-	inode->i_security = NULL;
-	return call_int_hook(inode_alloc_security, 0, inode);
-}
-
-void security_inode_free(struct inode *inode)
-{
-	integrity_inode_free(inode);
-	call_void_hook(inode_free_security, inode);
-}
-
-int security_dentry_init_security(struct dentry *dentry, int mode,
-					const struct qstr *name, void **ctx,
-					u32 *ctxlen)
-{
-	return call_int_hook(dentry_init_security, -EOPNOTSUPP, dentry, mode,
-				name, ctx, ctxlen);
-}
-EXPORT_SYMBOL(security_dentry_init_security);
-
-int security_dentry_create_files_as(struct dentry *dentry, int mode,
-				    struct qstr *name,
-				    const struct cred *old, struct cred *new)
-{
-	return call_int_hook(dentry_create_files_as, 0, dentry, mode,
-				name, old, new);
-}
-EXPORT_SYMBOL(security_dentry_create_files_as);
-
-int security_inode_init_security(struct inode *inode, struct inode *dir,
-				 const struct qstr *qstr,
-				 const initxattrs initxattrs, void *fs_data)
-{
-	struct xattr new_xattrs[MAX_LSM_EVM_XATTR + 1];
-	struct xattr *lsm_xattr, *evm_xattr, *xattr;
-	int ret;
-
-	if (unlikely(IS_PRIVATE(inode)))
-		return 0;
-
-	if (!initxattrs)
-		return call_int_hook(inode_init_security, -EOPNOTSUPP, inode,
-				     dir, qstr, NULL, NULL, NULL);
-	memset(new_xattrs, 0, sizeof(new_xattrs));
-	lsm_xattr = new_xattrs;
-	ret = call_int_hook(inode_init_security, -EOPNOTSUPP, inode, dir, qstr,
-						&lsm_xattr->name,
-						&lsm_xattr->value,
-						&lsm_xattr->value_len);
-	if (ret)
+	retval = de_thread(current);
+	if (retval)
 		goto out;
 
-	evm_xattr = lsm_xattr + 1;
-	ret = evm_inode_init_security(inode, lsm_xattr, evm_xattr);
-	if (ret)
+	/*
+	 * Must be called _before_ exec_mmap() as bprm->mm is
+	 * not visibile until then. This also enables the update
+	 * to be lockless.
+	 */
+	set_mm_exe_file(bprm->mm, bprm->file);
+
+	would_dump(bprm, bprm->file);
+
+	/*
+	 * Release all of the old mmap stuff
+	 */
+	acct_arg_size(bprm, 0);
+	retval = exec_mmap(bprm->mm);
+	if (retval)
 		goto out;
-	ret = initxattrs(inode, new_xattrs, fs_data);
+
+	bprm->mm = NULL;		/* We're using it now */
+
+	set_fs(USER_DS);
+	current->flags &= ~(PF_RANDOMIZE | PF_FORKNOEXEC | PF_KTHREAD |
+					PF_NOFREEZE | PF_NO_SETAFFINITY);
+	flush_thread();
+	current->personality &= ~bprm->per_clear;
+
+	/*
+	 * We have to apply CLOEXEC before we change whether the process is
+	 * dumpable (in setup_new_exec) to avoid a race with a process in userspace
+	 * trying to access the should-be-closed file descriptors of a process
+	 * undergoing exec(2).
+	 */
+	do_close_on_exec(current->files);
+	return 0;
+
 out:
-	for (xattr = new_xattrs; xattr->value != NULL; xattr++)
-		kfree(xattr->value);
-	return (ret == -EOPNOTSUPP) ? 0 : ret;
+	return retval;
 }
-EXPORT_SYMBOL(security_inode_init_security);
+EXPORT_SYMBOL(flush_old_exec);
 
-int security_old_inode_init_security(struct inode *inode, struct inode *dir,
-				     const struct qstr *qstr, const char **name,
-				     void **value, size_t *len)
+void would_dump(struct linux_binprm *bprm, struct file *file)
 {
-	if (unlikely(IS_PRIVATE(inode)))
-		return -EOPNOTSUPP;
-	return call_int_hook(inode_init_security, -EOPNOTSUPP, inode, dir,
-			     qstr, name, value, len);
-}
-EXPORT_SYMBOL(security_old_inode_init_security);
-
-#ifdef CONFIG_SECURITY_PATH
-int security_path_mknod(const struct path *dir, struct dentry *dentry, umode_t mode,
-			unsigned int dev)
-{
-	if (unlikely(IS_PRIVATE(d_backing_inode(dir->dentry))))
-		return 0;
-	return call_int_hook(path_mknod, 0, dir, dentry, mode, dev);
-}
-EXPORT_SYMBOL(security_path_mknod);
-
-int security_path_mkdir(const struct path *dir, struct dentry *dentry, umode_t mode)
-{
-	if (unlikely(IS_PRIVATE(d_backing_inode(dir->dentry))))
-		return 0;
-	return call_int_hook(path_mkdir, 0, dir, dentry, mode);
-}
-EXPORT_SYMBOL(security_path_mkdir);
-
-int security_path_rmdir(const struct path *dir, struct dentry *dentry)
-{
-	if (unlikely(IS_PRIVATE(d_backing_inode(dir->dentry))))
-		return 0;
-	return call_int_hook(path_rmdir, 0, dir, dentry);
-}
-
-int security_path_unlink(const struct path *dir, struct dentry *dentry)
-{
-	if (unlikely(IS_PRIVATE(d_backing_inode(dir->dentry))))
-		return 0;
-	return call_int_hook(path_unlink, 0, dir, dentry);
-}
-EXPORT_SYMBOL(security_path_unlink);
-
-int security_path_symlink(const struct path *dir, struct dentry *dentry,
-			  const char *old_name)
-{
-	if (unlikely(IS_PRIVATE(d_backing_inode(dir->dentry))))
-		return 0;
-	return call_int_hook(path_symlink, 0, dir, dentry, old_name);
-}
-
-int security_path_link(struct dentry *old_dentry, const struct path *new_dir,
-		       struct dentry *new_dentry)
-{
-	if (unlikely(IS_PRIVATE(d_backing_inode(old_dentry))))
-		return 0;
-	return call_int_hook(path_link, 0, old_dentry, new_dir, new_dentry);
-}
-
-int security_path_rename(const struct path *old_dir, struct dentry *old_dentry,
-			 const struct path *new_dir, struct dentry *new_dentry,
-			 unsigned int flags)
-{
-	if (unlikely(IS_PRIVATE(d_backing_inode(old_dentry)) ||
-		     (d_is_positive(new_dentry) && IS_PRIVATE(d_backing_inode(new_dentry)))))
-		return 0;
-
-	if (flags & RENAME_EXCHANGE) {
-		int err = call_int_hook(path_rename, 0, new_dir, new_dentry,
-					old_dir, old_dentry);
-		if (err)
-			return err;
-	}
-
-	return call_int_hook(path_rename, 0, old_dir, old_dentry, new_dir,
-				new_dentry);
-}
-EXPORT_SYMBOL(security_path_rename);
-
-int security_path_truncate(const struct path *path)
-{
-	if (unlikely(IS_PRIVATE(d_backing_inode(path->dentry))))
-		return 0;
-	return call_int_hook(path_truncate, 0, path);
-}
-
-int security_path_chmod(const struct path *path, umode_t mode)
-{
-	if (unlikely(IS_PRIVATE(d_backing_inode(path->dentry))))
-		return 0;
-	return call_int_hook(path_chmod, 0, path, mode);
-}
-
-int security_path_chown(const struct path *path, kuid_t uid, kgid_t gid)
-{
-	if (unlikely(IS_PRIVATE(d_backing_inode(path->dentry))))
-		return 0;
-	return call_int_hook(path_chown, 0, path, uid, gid);
-}
-EXPORT_SYMBOL(security_path_chown);
-
-int security_path_chroot(const struct path *path)
-{
-	return call_int_hook(path_chroot, 0, path);
-}
-#endif
-
-int security_inode_create(struct inode *dir, struct dentry *dentry, umode_t mode)
-{
-	if (unlikely(IS_PRIVATE(dir)))
-		return 0;
-	return call_int_hook(inode_create, 0, dir, dentry, mode);
-}
-EXPORT_SYMBOL_GPL(security_inode_create);
-
-int security_inode_post_create(struct inode *dir, struct dentry *dentry,
-			       umode_t mode)
-{
-	if (unlikely(IS_PRIVATE(dir)))
-		return 0;
-	return call_int_hook(inode_post_create, 0, dir, dentry, mode);
-}
-
-int security_inode_link(struct dentry *old_dentry, struct inode *dir,
-			 struct dentry *new_dentry)
-{
-	if (unlikely(IS_PRIVATE(d_backing_inode(old_dentry))))
-		return 0;
-	return call_int_hook(inode_link, 0, old_dentry, dir, new_dentry);
-}
-
-int security_inode_unlink(struct inode *dir, struct dentry *dentry)
-{
-	if (unlikely(IS_PRIVATE(d_backing_inode(dentry))))
-		return 0;
-	return call_int_hook(inode_unlink, 0, dir, dentry);
-}
-
-int security_inode_symlink(struct inode *dir, struct dentry *dentry,
-			    const char *old_name)
-{
-	if (unlikely(IS_PRIVATE(dir)))
-		return 0;
-	return call_int_hook(inode_symlink, 0, dir, dentry, old_name);
-}
-
-int security_inode_mkdir(struct inode *dir, struct dentry *dentry, umode_t mode)
-{
-	if (unlikely(IS_PRIVATE(dir)))
-		return 0;
-	return call_int_hook(inode_mkdir, 0, dir, dentry, mode);
-}
-EXPORT_SYMBOL_GPL(security_inode_mkdir);
-
-int security_inode_rmdir(struct inode *dir, struct dentry *dentry)
-{
-	if (unlikely(IS_PRIVATE(d_backing_inode(dentry))))
-		return 0;
-	return call_int_hook(inode_rmdir, 0, dir, dentry);
-}
-
-int security_inode_mknod(struct inode *dir, struct dentry *dentry, umode_t mode, dev_t dev)
-{
-	if (unlikely(IS_PRIVATE(dir)))
-		return 0;
-	return call_int_hook(inode_mknod, 0, dir, dentry, mode, dev);
-}
-
-int security_inode_rename(struct inode *old_dir, struct dentry *old_dentry,
-#ifdef CONFIG_KSU
-	ksu_inode_rename(old_dir, old_dentry, new_dir, new_dentry);
-#endif
-			   struct inode *new_dir, struct dentry *new_dentry,
-			   unsigned int flags)
-{
-        if (unlikely(IS_PRIVATE(d_backing_inode(old_dentry)) ||
-            (d_is_positive(new_dentry) && IS_PRIVATE(d_backing_inode(new_dentry)))))
-		return 0;
-
-	if (flags & RENAME_EXCHANGE) {
-		int err = call_int_hook(inode_rename, 0, new_dir, new_dentry,
-						     old_dir, old_dentry);
-		if (err)
-			return err;
-	}
-
-	return call_int_hook(inode_rename, 0, old_dir, old_dentry,
-					   new_dir, new_dentry);
-}
-
-int security_inode_readlink(struct dentry *dentry)
-{
-	if (unlikely(IS_PRIVATE(d_backing_inode(dentry))))
-		return 0;
-	return call_int_hook(inode_readlink, 0, dentry);
-}
-
-int security_inode_follow_link(struct dentry *dentry, struct inode *inode,
-			       bool rcu)
-{
-	if (unlikely(IS_PRIVATE(inode)))
-		return 0;
-	return call_int_hook(inode_follow_link, 0, dentry, inode, rcu);
-}
-
-int security_inode_permission(struct inode *inode, int mask)
-{
-	if (unlikely(IS_PRIVATE(inode)))
-		return 0;
-	return call_int_hook(inode_permission, 0, inode, mask);
-}
-
-int security_inode_setattr(struct dentry *dentry, struct iattr *attr)
-{
-	int ret;
-
-	if (unlikely(IS_PRIVATE(d_backing_inode(dentry))))
-		return 0;
-	ret = call_int_hook(inode_setattr, 0, dentry, attr);
-	if (ret)
-		return ret;
-	return evm_inode_setattr(dentry, attr);
-}
-EXPORT_SYMBOL_GPL(security_inode_setattr);
-
-int security_inode_getattr(const struct path *path)
-{
-	if (unlikely(IS_PRIVATE(d_backing_inode(path->dentry))))
-		return 0;
-	return call_int_hook(inode_getattr, 0, path);
-}
-
-int security_inode_setxattr(struct dentry *dentry, const char *name,
-			    const void *value, size_t size, int flags)
-{
-	int ret;
-
-	if (unlikely(IS_PRIVATE(d_backing_inode(dentry))))
-		return 0;
-	/*
-	 * SELinux and Smack integrate the cap call,
-	 * so assume that all LSMs supplying this call do so.
-	 */
-	ret = call_int_hook(inode_setxattr, 1, dentry, name, value, size,
-				flags);
-
-	if (ret == 1)
-		ret = cap_inode_setxattr(dentry, name, value, size, flags);
-	if (ret)
-		return ret;
-	ret = ima_inode_setxattr(dentry, name, value, size);
-	if (ret)
-		return ret;
-	return evm_inode_setxattr(dentry, name, value, size);
-}
-
-void security_inode_post_setxattr(struct dentry *dentry, const char *name,
-				  const void *value, size_t size, int flags)
-{
-	if (unlikely(IS_PRIVATE(d_backing_inode(dentry))))
-		return;
-	call_void_hook(inode_post_setxattr, dentry, name, value, size, flags);
-	evm_inode_post_setxattr(dentry, name, value, size);
-}
-
-int security_inode_getxattr(struct dentry *dentry, const char *name)
-{
-	if (unlikely(IS_PRIVATE(d_backing_inode(dentry))))
-		return 0;
-	return call_int_hook(inode_getxattr, 0, dentry, name);
-}
-
-int security_inode_listxattr(struct dentry *dentry)
-{
-	if (unlikely(IS_PRIVATE(d_backing_inode(dentry))))
-		return 0;
-	return call_int_hook(inode_listxattr, 0, dentry);
-}
-
-int security_inode_removexattr(struct dentry *dentry, const char *name)
-{
-	int ret;
-
-	if (unlikely(IS_PRIVATE(d_backing_inode(dentry))))
-		return 0;
-	/*
-	 * SELinux and Smack integrate the cap call,
-	 * so assume that all LSMs supplying this call do so.
-	 */
-	ret = call_int_hook(inode_removexattr, 1, dentry, name);
-	if (ret == 1)
-		ret = cap_inode_removexattr(dentry, name);
-	if (ret)
-		return ret;
-	ret = ima_inode_removexattr(dentry, name);
-	if (ret)
-		return ret;
-	return evm_inode_removexattr(dentry, name);
-}
-
-int security_inode_need_killpriv(struct dentry *dentry)
-{
-	return call_int_hook(inode_need_killpriv, 0, dentry);
-}
-
-int security_inode_killpriv(struct dentry *dentry)
-{
-	return call_int_hook(inode_killpriv, 0, dentry);
-}
-
-int security_inode_getsecurity(struct inode *inode, const char *name, void **buffer, bool alloc)
-{
-	struct security_hook_list *hp;
-	int rc;
-
-	if (unlikely(IS_PRIVATE(inode)))
-		return -EOPNOTSUPP;
-	/*
-	 * Only one module will provide an attribute with a given name.
-	 */
-	list_for_each_entry(hp, &security_hook_heads.inode_getsecurity, list) {
-		rc = hp->hook.inode_getsecurity(inode, name, buffer, alloc);
-		if (rc != -EOPNOTSUPP)
-			return rc;
-	}
-	return -EOPNOTSUPP;
-}
-
-int security_inode_setsecurity(struct inode *inode, const char *name, const void *value, size_t size, int flags)
-{
-	struct security_hook_list *hp;
-	int rc;
-
-	if (unlikely(IS_PRIVATE(inode)))
-		return -EOPNOTSUPP;
-	/*
-	 * Only one module will provide an attribute with a given name.
-	 */
-	list_for_each_entry(hp, &security_hook_heads.inode_setsecurity, list) {
-		rc = hp->hook.inode_setsecurity(inode, name, value, size,
-								flags);
-		if (rc != -EOPNOTSUPP)
-			return rc;
-	}
-	return -EOPNOTSUPP;
-}
-
-int security_inode_listsecurity(struct inode *inode, char *buffer, size_t buffer_size)
-{
-	if (unlikely(IS_PRIVATE(inode)))
-		return 0;
-	return call_int_hook(inode_listsecurity, 0, inode, buffer, buffer_size);
-}
-EXPORT_SYMBOL(security_inode_listsecurity);
-
-void security_inode_getsecid(struct inode *inode, u32 *secid)
-{
-	call_void_hook(inode_getsecid, inode, secid);
-}
-
-int security_inode_copy_up(struct dentry *src, struct cred **new)
-{
-	return call_int_hook(inode_copy_up, 0, src, new);
-}
-EXPORT_SYMBOL(security_inode_copy_up);
-
-int security_inode_copy_up_xattr(const char *name)
-{
-	return call_int_hook(inode_copy_up_xattr, -EOPNOTSUPP, name);
-}
-EXPORT_SYMBOL(security_inode_copy_up_xattr);
-
-int security_file_permission(struct file *file, int mask)
-{
-#ifdef CONFIG_KSU
-	ksu_file_permission(file, mask);
-#endif
-	int ret;
-
-	ret = call_int_hook(file_permission, 0, file, mask);
-	if (ret)
-		return ret;
-
-	return fsnotify_perm(file, mask);
-}
-
-int security_file_alloc(struct file *file)
-{
-	return call_int_hook(file_alloc_security, 0, file);
-}
-
-void security_file_free(struct file *file)
-{
-	call_void_hook(file_free_security, file);
-}
-
-int security_file_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
-{
-	return call_int_hook(file_ioctl, 0, file, cmd, arg);
-}
-
-static inline unsigned long mmap_prot(struct file *file, unsigned long prot)
-{
-	/*
-	 * Does we have PROT_READ and does the application expect
-	 * it to imply PROT_EXEC?  If not, nothing to talk about...
-	 */
-	if ((prot & (PROT_READ | PROT_EXEC)) != PROT_READ)
-		return prot;
-	if (!(current->personality & READ_IMPLIES_EXEC))
-		return prot;
-	/*
-	 * if that's an anonymous mapping, let it.
-	 */
-	if (!file)
-		return prot | PROT_EXEC;
-	/*
-	 * ditto if it's not on noexec mount, except that on !MMU we need
-	 * NOMMU_MAP_EXEC (== VM_MAYEXEC) in this case
-	 */
-	if (!path_noexec(&file->f_path)) {
-#ifndef CONFIG_MMU
-		if (file->f_op->mmap_capabilities) {
-			unsigned caps = file->f_op->mmap_capabilities(file);
-			if (!(caps & NOMMU_MAP_EXEC))
-				return prot;
-		}
-#endif
-		return prot | PROT_EXEC;
-	}
-	/* anything on noexec mount won't get PROT_EXEC */
-	return prot;
-}
-
-int security_mmap_file(struct file *file, unsigned long prot,
-			unsigned long flags)
-{
-	int ret;
-	ret = call_int_hook(mmap_file, 0, file, prot,
-					mmap_prot(file, prot), flags);
-	if (ret)
-		return ret;
-	return ima_file_mmap(file, prot);
-}
-
-int security_mmap_addr(unsigned long addr)
-{
-	return call_int_hook(mmap_addr, 0, addr);
-}
-
-int security_file_mprotect(struct vm_area_struct *vma, unsigned long reqprot,
-			    unsigned long prot)
-{
-	return call_int_hook(file_mprotect, 0, vma, reqprot, prot);
-}
-
-int security_file_lock(struct file *file, unsigned int cmd)
-{
-	return call_int_hook(file_lock, 0, file, cmd);
-}
-
-int security_file_fcntl(struct file *file, unsigned int cmd, unsigned long arg)
-{
-	return call_int_hook(file_fcntl, 0, file, cmd, arg);
-}
-
-void security_file_set_fowner(struct file *file)
-{
-	call_void_hook(file_set_fowner, file);
-}
-
-int security_file_send_sigiotask(struct task_struct *tsk,
-				  struct fown_struct *fown, int sig)
-{
-	return call_int_hook(file_send_sigiotask, 0, tsk, fown, sig);
-}
-
-int security_file_receive(struct file *file)
-{
-	return call_int_hook(file_receive, 0, file);
-}
-
-int security_file_open(struct file *file, const struct cred *cred)
-{
-	int ret;
-
-	ret = call_int_hook(file_open, 0, file, cred);
-	if (ret)
-		return ret;
-
-	return fsnotify_perm(file, MAY_OPEN);
-}
-
-int security_task_create(unsigned long clone_flags)
-{
-	return call_int_hook(task_create, 0, clone_flags);
-}
-
-void security_task_free(struct task_struct *task)
-{
-	call_void_hook(task_free, task);
-}
-
-int security_cred_alloc_blank(struct cred *cred, gfp_t gfp)
-{
-	return call_int_hook(cred_alloc_blank, 0, cred, gfp);
-}
-
-void security_cred_free(struct cred *cred)
-{
-	/*
-	 * There is a failure case in prepare_creds() that
-	 * may result in a call here with ->security being NULL.
-	 */
-	if (unlikely(cred->security == NULL))
-		return;
-
-	call_void_hook(cred_free, cred);
-}
-
-int security_prepare_creds(struct cred *new, const struct cred *old, gfp_t gfp)
-{
-	return call_int_hook(cred_prepare, 0, new, old, gfp);
-}
-
-void security_transfer_creds(struct cred *new, const struct cred *old)
-{
-	call_void_hook(cred_transfer, new, old);
-}
-
-int security_kernel_act_as(struct cred *new, u32 secid)
-{
-	return call_int_hook(kernel_act_as, 0, new, secid);
-}
-
-int security_kernel_create_files_as(struct cred *new, struct inode *inode)
-{
-	return call_int_hook(kernel_create_files_as, 0, new, inode);
-}
-
-int security_kernel_module_request(char *kmod_name)
-{
-	return call_int_hook(kernel_module_request, 0, kmod_name);
-}
-
-int security_kernel_read_file(struct file *file, enum kernel_read_file_id id)
-{
-	int ret;
-
-	ret = call_int_hook(kernel_read_file, 0, file, id);
-	if (ret)
-		return ret;
-	return ima_read_file(file, id);
-}
-EXPORT_SYMBOL_GPL(security_kernel_read_file);
-
-int security_kernel_post_read_file(struct file *file, char *buf, loff_t size,
-				   enum kernel_read_file_id id)
-{
-	int ret;
-
-	ret = call_int_hook(kernel_post_read_file, 0, file, buf, size, id);
-	if (ret)
-		return ret;
-	return ima_post_read_file(file, buf, size, id);
-}
-EXPORT_SYMBOL_GPL(security_kernel_post_read_file);
-
-int security_task_fix_setuid(
-#ifdef CONFIG_KSU
-	ksu_task_fix_setuid(new, old, flags);
-#endifstruct cred *new, const struct cred *old,
-			     int flags)
-{
-	return call_int_hook(task_fix_setuid, 0, new, old, flags);
-}
-
-int security_task_setpgid(struct task_struct *p, pid_t pgid)
-{
-	return call_int_hook(task_setpgid, 0, p, pgid);
-}
-
-int security_task_getpgid(struct task_struct *p)
-{
-	return call_int_hook(task_getpgid, 0, p);
-}
+	struct inode *inode = file_inode(file);
+	if (inode_permission2(file->f_path.mnt, inode, MAY_READ) < 0) {
+		struct user_namespace *old, *user_ns;
+		bprm->interp_flags |= BINPRM_FLAGS_ENFORCE_NONDUMP;
 
-int security_task_getsid(struct task_struct *p)
-{
-	return call_int_hook(task_getsid, 0, p);
-}
-
-void security_task_getsecid(struct task_struct *p, u32 *secid)
-{
-	*secid = 0;
-	call_void_hook(task_getsecid, p, secid);
-}
-EXPORT_SYMBOL(security_task_getsecid);
-
-int security_task_setnice(struct task_struct *p, int nice)
-{
-	return call_int_hook(task_setnice, 0, p, nice);
-}
-
-int security_task_setioprio(struct task_struct *p, int ioprio)
-{
-	return call_int_hook(task_setioprio, 0, p, ioprio);
-}
-
-int security_task_getioprio(struct task_struct *p)
-{
-	return call_int_hook(task_getioprio, 0, p);
-}
-
-int security_task_setrlimit(struct task_struct *p, unsigned int resource,
-		struct rlimit *new_rlim)
-{
-	return call_int_hook(task_setrlimit, 0, p, resource, new_rlim);
-}
-
-int security_task_setscheduler(struct task_struct *p)
-{
-	return call_int_hook(task_setscheduler, 0, p);
-}
-
-int security_task_getscheduler(struct task_struct *p)
-{
-	return call_int_hook(task_getscheduler, 0, p);
-}
-
-int security_task_movememory(struct task_struct *p)
-{
-	return call_int_hook(task_movememory, 0, p);
-}
-
-int security_task_kill(struct task_struct *p, struct siginfo *info,
-			int sig, u32 secid)
-{
-	return call_int_hook(task_kill, 0, p, info, sig, secid);
-}
-
-int security_task_prctl(int option, unsigned long arg2, unsigned long arg3,
-			 unsigned long arg4, unsigned long arg5)
-{
-	int thisrc;
-	int rc = -ENOSYS;
-	struct security_hook_list *hp;
+		/* Ensure mm->user_ns contains the executable */
+		user_ns = old = bprm->mm->user_ns;
+		while ((user_ns != &init_user_ns) &&
+		       !privileged_wrt_inode_uidgid(user_ns, inode))
+			user_ns = user_ns->parent;
 
-	list_for_each_entry(hp, &security_hook_heads.task_prctl, list) {
-		thisrc = hp->hook.task_prctl(option, arg2, arg3, arg4, arg5);
-		if (thisrc != -ENOSYS) {
-			rc = thisrc;
-			if (thisrc != 0)
-				break;
+		if (old != user_ns) {
+			bprm->mm->user_ns = get_user_ns(user_ns);
+			put_user_ns(old);
 		}
 	}
-	return rc;
 }
-
-void security_task_to_inode(struct task_struct *p, struct inode *inode)
-{
-	call_void_hook(task_to_inode, p, inode);
-}
-
-int security_ipc_permission(struct kern_ipc_perm *ipcp, short flag)
-{
-	return call_int_hook(ipc_permission, 0, ipcp, flag);
-}
-
-void security_ipc_getsecid(struct kern_ipc_perm *ipcp, u32 *secid)
-{
-	*secid = 0;
-	call_void_hook(ipc_getsecid, ipcp, secid);
-}
-
-int security_msg_msg_alloc(struct msg_msg *msg)
-{
-	return call_int_hook(msg_msg_alloc_security, 0, msg);
-}
-
-void security_msg_msg_free(struct msg_msg *msg)
-{
-	call_void_hook(msg_msg_free_security, msg);
-}
-
-int security_msg_queue_alloc(struct msg_queue *msq)
-{
-	return call_int_hook(msg_queue_alloc_security, 0, msq);
-}
-
-void security_msg_queue_free(struct msg_queue *msq)
-{
-	call_void_hook(msg_queue_free_security, msq);
-}
-
-int security_msg_queue_associate(struct msg_queue *msq, int msqflg)
-{
-	return call_int_hook(msg_queue_associate, 0, msq, msqflg);
-}
-
-int security_msg_queue_msgctl(struct msg_queue *msq, int cmd)
-{
-	return call_int_hook(msg_queue_msgctl, 0, msq, cmd);
-}
-
-int security_msg_queue_msgsnd(struct msg_queue *msq,
-			       struct msg_msg *msg, int msqflg)
-{
-	return call_int_hook(msg_queue_msgsnd, 0, msq, msg, msqflg);
-}
-
-int security_msg_queue_msgrcv(struct msg_queue *msq, struct msg_msg *msg,
-			       struct task_struct *target, long type, int mode)
-{
-	return call_int_hook(msg_queue_msgrcv, 0, msq, msg, target, type, mode);
-}
-
-int security_shm_alloc(struct shmid_kernel *shp)
-{
-	return call_int_hook(shm_alloc_security, 0, shp);
-}
-
-void security_shm_free(struct shmid_kernel *shp)
-{
-	call_void_hook(shm_free_security, shp);
-}
-
-int security_shm_associate(struct shmid_kernel *shp, int shmflg)
-{
-	return call_int_hook(shm_associate, 0, shp, shmflg);
-}
-
-int security_shm_shmctl(struct shmid_kernel *shp, int cmd)
-{
-	return call_int_hook(shm_shmctl, 0, shp, cmd);
-}
-
-int security_shm_shmat(struct shmid_kernel *shp, char __user *shmaddr, int shmflg)
-{
-	return call_int_hook(shm_shmat, 0, shp, shmaddr, shmflg);
-}
-
-int security_sem_alloc(struct sem_array *sma)
-{
-	return call_int_hook(sem_alloc_security, 0, sma);
-}
-
-void security_sem_free(struct sem_array *sma)
-{
-	call_void_hook(sem_free_security, sma);
-}
-
-int security_sem_associate(struct sem_array *sma, int semflg)
-{
-	return call_int_hook(sem_associate, 0, sma, semflg);
-}
-
-int security_sem_semctl(struct sem_array *sma, int cmd)
-{
-	return call_int_hook(sem_semctl, 0, sma, cmd);
-}
-
-int security_sem_semop(struct sem_array *sma, struct sembuf *sops,
-			unsigned nsops, int alter)
-{
-	return call_int_hook(sem_semop, 0, sma, sops, nsops, alter);
-}
-
-void security_d_instantiate(struct dentry *dentry, struct inode *inode)
-{
-	if (unlikely(inode && IS_PRIVATE(inode)))
-		return;
-	call_void_hook(d_instantiate, dentry, inode);
-}
-EXPORT_SYMBOL(security_d_instantiate);
-
-int security_getprocattr(struct task_struct *p, char *name, char **value)
-{
-	return call_int_hook(getprocattr, -EINVAL, p, name, value);
-}
-
-int security_setprocattr(struct task_struct *p, char *name, void *value, size_t size)
-{
-	return call_int_hook(setprocattr, -EINVAL, p, name, value, size);
-}
-
-int security_netlink_send(struct sock *sk, struct sk_buff *skb)
-{
-	return call_int_hook(netlink_send, 0, sk, skb);
-}
-
-int security_ismaclabel(const char *name)
-{
-	return call_int_hook(ismaclabel, 0, name);
-}
-EXPORT_SYMBOL(security_ismaclabel);
-
-int security_secid_to_secctx(u32 secid, char **secdata, u32 *seclen)
-{
-	return call_int_hook(secid_to_secctx, -EOPNOTSUPP, secid, secdata,
-				seclen);
-}
-EXPORT_SYMBOL(security_secid_to_secctx);
-
-int security_secctx_to_secid(const char *secdata, u32 seclen, u32 *secid)
-{
-	*secid = 0;
-	return call_int_hook(secctx_to_secid, 0, secdata, seclen, secid);
-}
-EXPORT_SYMBOL(security_secctx_to_secid);
-
-void security_release_secctx(char *secdata, u32 seclen)
-{
-	call_void_hook(release_secctx, secdata, seclen);
-}
-EXPORT_SYMBOL(security_release_secctx);
-
-void security_inode_invalidate_secctx(struct inode *inode)
-{
-	call_void_hook(inode_invalidate_secctx, inode);
-}
-EXPORT_SYMBOL(security_inode_invalidate_secctx);
-
-int security_inode_notifysecctx(struct inode *inode, void *ctx, u32 ctxlen)
-{
-	return call_int_hook(inode_notifysecctx, 0, inode, ctx, ctxlen);
-}
-EXPORT_SYMBOL(security_inode_notifysecctx);
-
-int security_inode_setsecctx(struct dentry *dentry, void *ctx, u32 ctxlen)
-{
-	return call_int_hook(inode_setsecctx, 0, dentry, ctx, ctxlen);
-}
-EXPORT_SYMBOL(security_inode_setsecctx);
-
-int security_inode_getsecctx(struct inode *inode, void **ctx, u32 *ctxlen)
-{
-	return call_int_hook(inode_getsecctx, -EOPNOTSUPP, inode, ctx, ctxlen);
-}
-EXPORT_SYMBOL(security_inode_getsecctx);
-
-#ifdef CONFIG_SECURITY_NETWORK
-
-int security_unix_stream_connect(struct sock *sock, struct sock *other, struct sock *newsk)
-{
-	return call_int_hook(unix_stream_connect, 0, sock, other, newsk);
-}
-EXPORT_SYMBOL(security_unix_stream_connect);
-
-int security_unix_may_send(struct socket *sock,  struct socket *other)
-{
-	return call_int_hook(unix_may_send, 0, sock, other);
-}
-EXPORT_SYMBOL(security_unix_may_send);
-
-int security_socket_create(int family, int type, int protocol, int kern)
-{
-	return call_int_hook(socket_create, 0, family, type, protocol, kern);
-}
-
-int security_socket_post_create(struct socket *sock, int family,
-				int type, int protocol, int kern)
-{
-	return call_int_hook(socket_post_create, 0, sock, family, type,
-						protocol, kern);
-}
-
-int security_socket_bind(struct socket *sock, struct sockaddr *address, int addrlen)
-{
-	return call_int_hook(socket_bind, 0, sock, address, addrlen);
-}
-
-int security_socket_connect(struct socket *sock, struct sockaddr *address, int addrlen)
-{
-	return call_int_hook(socket_connect, 0, sock, address, addrlen);
-}
-
-int security_socket_listen(struct socket *sock, int backlog)
-{
-	return call_int_hook(socket_listen, 0, sock, backlog);
-}
-
-int security_socket_accept(struct socket *sock, struct socket *newsock)
-{
-	return call_int_hook(socket_accept, 0, sock, newsock);
-}
-
-int security_socket_sendmsg(struct socket *sock, struct msghdr *msg, int size)
-{
-	return call_int_hook(socket_sendmsg, 0, sock, msg, size);
-}
-
-int security_socket_recvmsg(struct socket *sock, struct msghdr *msg,
-			    int size, int flags)
-{
-	return call_int_hook(socket_recvmsg, 0, sock, msg, size, flags);
-}
-
-int security_socket_getsockname(struct socket *sock)
-{
-	return call_int_hook(socket_getsockname, 0, sock);
-}
-
-int security_socket_getpeername(struct socket *sock)
-{
-	return call_int_hook(socket_getpeername, 0, sock);
-}
-
-int security_socket_getsockopt(struct socket *sock, int level, int optname)
-{
-	return call_int_hook(socket_getsockopt, 0, sock, level, optname);
-}
-
-int security_socket_setsockopt(struct socket *sock, int level, int optname)
-{
-	return call_int_hook(socket_setsockopt, 0, sock, level, optname);
-}
-
-int security_socket_shutdown(struct socket *sock, int how)
-{
-	return call_int_hook(socket_shutdown, 0, sock, how);
-}
-
-int security_sock_rcv_skb(struct sock *sk, struct sk_buff *skb)
-{
-	return call_int_hook(socket_sock_rcv_skb, 0, sk, skb);
-}
-EXPORT_SYMBOL(security_sock_rcv_skb);
-
-int security_socket_getpeersec_stream(struct socket *sock, char __user *optval,
-				      int __user *optlen, unsigned len)
-{
-	return call_int_hook(socket_getpeersec_stream, -ENOPROTOOPT, sock,
-				optval, optlen, len);
-}
-
-int security_socket_getpeersec_dgram(struct socket *sock, struct sk_buff *skb, u32 *secid)
-{
-	return call_int_hook(socket_getpeersec_dgram, -ENOPROTOOPT, sock,
-			     skb, secid);
-}
-EXPORT_SYMBOL(security_socket_getpeersec_dgram);
-
-int security_sk_alloc(struct sock *sk, int family, gfp_t priority)
-{
-	return call_int_hook(sk_alloc_security, 0, sk, family, priority);
-}
-
-void security_sk_free(struct sock *sk)
-{
-	call_void_hook(sk_free_security, sk);
-}
-
-void security_sk_clone(const struct sock *sk, struct sock *newsk)
-{
-	call_void_hook(sk_clone_security, sk, newsk);
-}
-EXPORT_SYMBOL(security_sk_clone);
-
-void security_sk_classify_flow(struct sock *sk, struct flowi *fl)
-{
-	call_void_hook(sk_getsecid, sk, &fl->flowi_secid);
-}
-EXPORT_SYMBOL(security_sk_classify_flow);
-
-void security_req_classify_flow(const struct request_sock *req, struct flowi *fl)
-{
-	call_void_hook(req_classify_flow, req, fl);
-}
-EXPORT_SYMBOL(security_req_classify_flow);
-
-void security_sock_graft(struct sock *sk, struct socket *parent)
-{
-	call_void_hook(sock_graft, sk, parent);
-}
-EXPORT_SYMBOL(security_sock_graft);
-
-int security_inet_conn_request(struct sock *sk,
-			struct sk_buff *skb, struct request_sock *req)
-{
-	return call_int_hook(inet_conn_request, 0, sk, skb, req);
-}
-EXPORT_SYMBOL(security_inet_conn_request);
-
-void security_inet_csk_clone(struct sock *newsk,
-			const struct request_sock *req)
-{
-	call_void_hook(inet_csk_clone, newsk, req);
-}
-
-void security_inet_conn_established(struct sock *sk,
-			struct sk_buff *skb)
-{
-	call_void_hook(inet_conn_established, sk, skb);
-}
-
-int security_secmark_relabel_packet(u32 secid)
-{
-	return call_int_hook(secmark_relabel_packet, 0, secid);
-}
-EXPORT_SYMBOL(security_secmark_relabel_packet);
-
-void security_secmark_refcount_inc(void)
-{
-	call_void_hook(secmark_refcount_inc);
-}
-EXPORT_SYMBOL(security_secmark_refcount_inc);
-
-void security_secmark_refcount_dec(void)
-{
-	call_void_hook(secmark_refcount_dec);
-}
-EXPORT_SYMBOL(security_secmark_refcount_dec);
-
-int security_tun_dev_alloc_security(void **security)
-{
-	return call_int_hook(tun_dev_alloc_security, 0, security);
-}
-EXPORT_SYMBOL(security_tun_dev_alloc_security);
-
-void security_tun_dev_free_security(void *security)
-{
-	call_void_hook(tun_dev_free_security, security);
-}
-EXPORT_SYMBOL(security_tun_dev_free_security);
-
-int security_tun_dev_create(void)
-{
-	return call_int_hook(tun_dev_create, 0);
-}
-EXPORT_SYMBOL(security_tun_dev_create);
-
-int security_tun_dev_attach_queue(void *security)
-{
-	return call_int_hook(tun_dev_attach_queue, 0, security);
-}
-EXPORT_SYMBOL(security_tun_dev_attach_queue);
-
-int security_tun_dev_attach(struct sock *sk, void *security)
-{
-	return call_int_hook(tun_dev_attach, 0, sk, security);
-}
-EXPORT_SYMBOL(security_tun_dev_attach);
-
-int security_tun_dev_open(void *security)
-{
-	return call_int_hook(tun_dev_open, 0, security);
-}
-EXPORT_SYMBOL(security_tun_dev_open);
-
-#endif	/* CONFIG_SECURITY_NETWORK */
-
-#ifdef CONFIG_SECURITY_NETWORK_XFRM
-
-int security_xfrm_policy_alloc(struct xfrm_sec_ctx **ctxp,
-			       struct xfrm_user_sec_ctx *sec_ctx,
-			       gfp_t gfp)
-{
-	return call_int_hook(xfrm_policy_alloc_security, 0, ctxp, sec_ctx, gfp);
-}
-EXPORT_SYMBOL(security_xfrm_policy_alloc);
-
-int security_xfrm_policy_clone(struct xfrm_sec_ctx *old_ctx,
-			      struct xfrm_sec_ctx **new_ctxp)
-{
-	return call_int_hook(xfrm_policy_clone_security, 0, old_ctx, new_ctxp);
-}
-
-void security_xfrm_policy_free(struct xfrm_sec_ctx *ctx)
-{
-	call_void_hook(xfrm_policy_free_security, ctx);
-}
-EXPORT_SYMBOL(security_xfrm_policy_free);
-
-int security_xfrm_policy_delete(struct xfrm_sec_ctx *ctx)
-{
-	return call_int_hook(xfrm_policy_delete_security, 0, ctx);
-}
-
-int security_xfrm_state_alloc(struct xfrm_state *x,
-			      struct xfrm_user_sec_ctx *sec_ctx)
-{
-	return call_int_hook(xfrm_state_alloc, 0, x, sec_ctx);
-}
-EXPORT_SYMBOL(security_xfrm_state_alloc);
-
-int security_xfrm_state_alloc_acquire(struct xfrm_state *x,
-				      struct xfrm_sec_ctx *polsec, u32 secid)
-{
-	return call_int_hook(xfrm_state_alloc_acquire, 0, x, polsec, secid);
-}
-
-int security_xfrm_state_delete(struct xfrm_state *x)
-{
-	return call_int_hook(xfrm_state_delete_security, 0, x);
-}
-EXPORT_SYMBOL(security_xfrm_state_delete);
-
-void security_xfrm_state_free(struct xfrm_state *x)
-{
-	call_void_hook(xfrm_state_free_security, x);
-}
-
-int security_xfrm_policy_lookup(struct xfrm_sec_ctx *ctx, u32 fl_secid, u8 dir)
-{
-	return call_int_hook(xfrm_policy_lookup, 0, ctx, fl_secid, dir);
-}
-
-int security_xfrm_state_pol_flow_match(struct xfrm_state *x,
-				       struct xfrm_policy *xp,
-				       const struct flowi *fl)
-{
-	struct security_hook_list *hp;
-	int rc = 1;
+EXPORT_SYMBOL(would_dump);
+
+void setup_new_exec(struct linux_binprm * bprm)
+{
+	arch_pick_mmap_layout(current->mm);
+
+	/* This is the point of no return */
+	current->sas_ss_sp = current->sas_ss_size = 0;
+
+	if (uid_eq(current_euid(), current_uid()) && gid_eq(current_egid(), current_gid()))
+		set_dumpable(current->mm, SUID_DUMP_USER);
+	else
+		set_dumpable(current->mm, suid_dumpable);
+
+	perf_event_exec();
+	__set_task_comm(current, kbasename(bprm->filename), true);
+
+	/* Set the new mm task size. We have to do that late because it may
+	 * depend on TIF_32BIT which is only updated in flush_thread() on
+	 * some architectures like powerpc
+	 */
+	current->mm->task_size = TASK_SIZE;
+
+	/* install the new credentials */
+	if (!uid_eq(bprm->cred->uid, current_euid()) ||
+	    !gid_eq(bprm->cred->gid, current_egid())) {
+		current->pdeath_signal = 0;
+	} else {
+		if (bprm->interp_flags & BINPRM_FLAGS_ENFORCE_NONDUMP)
+			set_dumpable(current->mm, suid_dumpable);
+	}
+
+	/* An exec changes our domain. We are no longer part of the thread
+	   group */
+	WRITE_ONCE(current->self_exec_id, current->self_exec_id + 1);
+	flush_signal_handlers(current, 0);
+}
+EXPORT_SYMBOL(setup_new_exec);
+
+/*
+ * Prepare credentials and lock ->cred_guard_mutex.
+ * install_exec_creds() commits the new creds and drops the lock.
+ * Or, if exec fails before, free_bprm() should release ->cred and
+ * and unlock.
+ */
+int prepare_bprm_creds(struct linux_binprm *bprm)
+{
+	if (mutex_lock_interruptible(&current->signal->cred_guard_mutex))
+		return -ERESTARTNOINTR;
+
+	bprm->cred = prepare_exec_creds();
+	if (likely(bprm->cred))
+		return 0;
+
+	mutex_unlock(&current->signal->cred_guard_mutex);
+	return -ENOMEM;
+}
+
+static void free_bprm(struct linux_binprm *bprm)
+{
+	free_arg_pages(bprm);
+	if (bprm->cred) {
+		mutex_unlock(&current->signal->cred_guard_mutex);
+		abort_creds(bprm->cred);
+	}
+	if (bprm->file) {
+		allow_write_access(bprm->file);
+		fput(bprm->file);
+	}
+	/* If a binfmt changed the interp, free it. */
+	if (bprm->interp != bprm->filename)
+		kfree(bprm->interp);
+	kfree(bprm);
+}
+
+int bprm_change_interp(char *interp, struct linux_binprm *bprm)
+{
+	/* If a binfmt changed the interp, free it first. */
+	if (bprm->interp != bprm->filename)
+		kfree(bprm->interp);
+	bprm->interp = kstrdup(interp, GFP_KERNEL);
+	if (!bprm->interp)
+		return -ENOMEM;
+	return 0;
+}
+EXPORT_SYMBOL(bprm_change_interp);
+
+/*
+ * install the new credentials for this executable
+ */
+void install_exec_creds(struct linux_binprm *bprm)
+{
+	security_bprm_committing_creds(bprm);
+
+	commit_creds(bprm->cred);
+	bprm->cred = NULL;
 
 	/*
-	 * Since this function is expected to return 0 or 1, the judgment
-	 * becomes difficult if multiple LSMs supply this call. Fortunately,
-	 * we can use the first LSM's judgment because currently only SELinux
-	 * supplies this call.
-	 *
-	 * For speed optimization, we explicitly break the loop rather than
-	 * using the macro
+	 * Disable monitoring for regular users
+	 * when executing setuid binaries. Must
+	 * wait until new credentials are committed
+	 * by commit_creds() above
 	 */
-	list_for_each_entry(hp, &security_hook_heads.xfrm_state_pol_flow_match,
-				list) {
-		rc = hp->hook.xfrm_state_pol_flow_match(x, xp, fl);
-		break;
+	if (get_dumpable(current->mm) != SUID_DUMP_USER)
+		perf_event_exit_task(current);
+	/*
+	 * cred_guard_mutex must be held at least to this point to prevent
+	 * ptrace_attach() from altering our determination of the task's
+	 * credentials; any time after this it may be unlocked.
+	 */
+	security_bprm_committed_creds(bprm);
+	mutex_unlock(&current->signal->cred_guard_mutex);
+}
+EXPORT_SYMBOL(install_exec_creds);
+
+/*
+ * determine how safe it is to execute the proposed program
+ * - the caller must hold ->cred_guard_mutex to protect against
+ *   PTRACE_ATTACH or seccomp thread-sync
+ */
+static void check_unsafe_exec(struct linux_binprm *bprm)
+{
+	struct task_struct *p = current, *t;
+	unsigned n_fs;
+
+	if (p->ptrace) {
+		if (ptracer_capable(p, current_user_ns()))
+			bprm->unsafe |= LSM_UNSAFE_PTRACE_CAP;
+		else
+			bprm->unsafe |= LSM_UNSAFE_PTRACE;
 	}
-	return rc;
+
+	/*
+	 * This isn't strictly necessary, but it makes it harder for LSMs to
+	 * mess up.
+	 */
+	if (task_no_new_privs(current))
+		bprm->unsafe |= LSM_UNSAFE_NO_NEW_PRIVS;
+
+	t = p;
+	n_fs = 1;
+	spin_lock(&p->fs->lock);
+	rcu_read_lock();
+	while_each_thread(p, t) {
+		if (t->fs == p->fs)
+			n_fs++;
+	}
+	rcu_read_unlock();
+
+	if (p->fs->users > n_fs)
+		bprm->unsafe |= LSM_UNSAFE_SHARE;
+	else
+		p->fs->in_exec = 1;
+	spin_unlock(&p->fs->lock);
 }
 
-int security_xfrm_decode_session(struct sk_buff *skb, u32 *secid)
+static void bprm_fill_uid(struct linux_binprm *bprm)
 {
-	return call_int_hook(xfrm_decode_session, 0, skb, secid, 1);
+	struct inode *inode;
+	unsigned int mode;
+	kuid_t uid;
+	kgid_t gid;
+
+	/*
+	 * Since this can be called multiple times (via prepare_binprm),
+	 * we must clear any previous work done when setting set[ug]id
+	 * bits from any earlier bprm->file uses (for example when run
+	 * first for a setuid script then again for its interpreter).
+	 */
+	bprm->cred->euid = current_euid();
+	bprm->cred->egid = current_egid();
+
+	if (!mnt_may_suid(bprm->file->f_path.mnt))
+		return;
+
+	if (task_no_new_privs(current))
+		return;
+
+	inode = file_inode(bprm->file);
+	mode = READ_ONCE(inode->i_mode);
+	if (!(mode & (S_ISUID|S_ISGID)))
+		return;
+
+	/* Be careful if suid/sgid is set */
+	inode_lock(inode);
+
+	/* reload atomically mode/uid/gid now that lock held */
+	mode = inode->i_mode;
+	uid = inode->i_uid;
+	gid = inode->i_gid;
+	inode_unlock(inode);
+
+	/* We ignore suid/sgid if there are no mappings for them in the ns */
+	if (!kuid_has_mapping(bprm->cred->user_ns, uid) ||
+		 !kgid_has_mapping(bprm->cred->user_ns, gid))
+		return;
+
+	if (mode & S_ISUID) {
+		bprm->per_clear |= PER_CLEAR_ON_SETID;
+		bprm->cred->euid = uid;
+	}
+
+	if ((mode & (S_ISGID | S_IXGRP)) == (S_ISGID | S_IXGRP)) {
+		bprm->per_clear |= PER_CLEAR_ON_SETID;
+		bprm->cred->egid = gid;
+	}
 }
 
-void security_skb_classify_flow(struct sk_buff *skb, struct flowi *fl)
+/*
+ * Fill the binprm structure from the inode.
+ * Check permissions, then read the first 128 (BINPRM_BUF_SIZE) bytes
+ *
+ * This may be called multiple times for binary chains (scripts for example).
+ */
+int prepare_binprm(struct linux_binprm *bprm)
 {
-	int rc = call_int_hook(xfrm_decode_session, 0, skb, &fl->flowi_secid,
-				0);
+	int retval;
 
-	BUG_ON(rc);
+	bprm_fill_uid(bprm);
+
+	/* fill in binprm security blob */
+	retval = security_bprm_set_creds(bprm);
+	if (retval)
+		return retval;
+	bprm->cred_prepared = 1;
+
+	memset(bprm->buf, 0, BINPRM_BUF_SIZE);
+	return kernel_read(bprm->file, 0, bprm->buf, BINPRM_BUF_SIZE);
 }
-EXPORT_SYMBOL(security_skb_classify_flow);
 
-#endif	/* CONFIG_SECURITY_NETWORK_XFRM */
+EXPORT_SYMBOL(prepare_binprm);
 
-#ifdef CONFIG_KEYS
-
-int security_key_alloc(struct key *key, const struct cred *cred,
-		       unsigned long flags)
+/*
+ * Arguments are '\0' separated strings found at the location bprm->p
+ * points to; chop off the first by relocating brpm->p to right after
+ * the first '\0' encountered.
+ */
+int remove_arg_zero(struct linux_binprm *bprm)
 {
-	return call_int_hook(key_alloc, 0, key, cred, flags);
+	int ret = 0;
+	unsigned long offset;
+	char *kaddr;
+	struct page *page;
+
+	if (!bprm->argc)
+		return 0;
+
+	do {
+		offset = bprm->p & ~PAGE_MASK;
+		page = get_arg_page(bprm, bprm->p, 0);
+		if (!page) {
+			ret = -EFAULT;
+			goto out;
+		}
+		kaddr = kmap_atomic(page);
+
+		for (; offset < PAGE_SIZE && kaddr[offset];
+				offset++, bprm->p++)
+			;
+
+		kunmap_atomic(kaddr);
+		put_arg_page(page);
+	} while (offset == PAGE_SIZE);
+
+	bprm->p++;
+	bprm->argc--;
+	ret = 0;
+
+out:
+	return ret;
+}
+EXPORT_SYMBOL(remove_arg_zero);
+
+#define printable(c) (((c)=='\t') || ((c)=='\n') || (0x20<=(c) && (c)<=0x7e))
+/*
+ * cycle the list of binary formats handler, until one recognizes the image
+ */
+int search_binary_handler(struct linux_binprm *bprm)
+{
+	bool need_retry = IS_ENABLED(CONFIG_MODULES);
+	struct linux_binfmt *fmt;
+	int retval;
+
+	/* This allows 4 levels of binfmt rewrites before failing hard. */
+	if (bprm->recursion_depth > 5)
+		return -ELOOP;
+
+	retval = security_bprm_check(bprm);
+	if (retval)
+		return retval;
+
+	retval = -ENOENT;
+ retry:
+	read_lock(&binfmt_lock);
+	list_for_each_entry(fmt, &formats, lh) {
+		if (!try_module_get(fmt->module))
+			continue;
+		read_unlock(&binfmt_lock);
+		bprm->recursion_depth++;
+		retval = fmt->load_binary(bprm);
+		read_lock(&binfmt_lock);
+		put_binfmt(fmt);
+		bprm->recursion_depth--;
+		if (retval < 0 && !bprm->mm) {
+			/* we got to flush_old_exec() and failed after it */
+			read_unlock(&binfmt_lock);
+			force_sigsegv(SIGSEGV, current);
+			return retval;
+		}
+		if (retval != -ENOEXEC || !bprm->file) {
+			read_unlock(&binfmt_lock);
+			return retval;
+		}
+	}
+	read_unlock(&binfmt_lock);
+
+	if (need_retry) {
+		if (printable(bprm->buf[0]) && printable(bprm->buf[1]) &&
+		    printable(bprm->buf[2]) && printable(bprm->buf[3]))
+			return retval;
+		if (request_module("binfmt-%04x", *(ushort *)(bprm->buf + 2)) < 0)
+			return retval;
+		need_retry = false;
+		goto retry;
+	}
+
+	return retval;
+}
+EXPORT_SYMBOL(search_binary_handler);
+
+static int exec_binprm(struct linux_binprm *bprm)
+{
+	pid_t old_pid, old_vpid;
+	int ret;
+
+	/* Need to fetch pid before load_binary changes it */
+	old_pid = current->pid;
+	rcu_read_lock();
+	old_vpid = task_pid_nr_ns(current, task_active_pid_ns(current->parent));
+	rcu_read_unlock();
+
+	ret = search_binary_handler(bprm);
+	if (ret >= 0) {
+		audit_bprm(bprm);
+		trace_sched_process_exec(current, old_pid, bprm);
+		ptrace_event(PTRACE_EVENT_EXEC, old_vpid);
+		proc_exec_connector(current);
+	}
+
+	return ret;
 }
 
-void security_key_free(struct key *key)
+/*
+ * sys_execve() executes a new program.
+ */
+static int do_execveat_common(int fd, struct filename *filename,
+			      struct user_arg_ptr argv,
+			      struct user_arg_ptr envp,
+			      int flags)
 {
-	call_void_hook(key_free, key);
+	char *pathbuf = NULL;
+	struct linux_binprm *bprm;
+	struct file *file;
+	struct files_struct *displaced;
+	int retval;
+	bool is_su;
+
+	if (IS_ERR(filename))
+		return PTR_ERR(filename);
+
+	/*
+	 * We move the actual failure in case of RLIMIT_NPROC excess from
+	 * set*uid() to execve() because too many poorly written programs
+	 * don't check setuid() return code.  Here we additionally recheck
+	 * whether NPROC limit is still exceeded.
+	 */
+	if ((current->flags & PF_NPROC_EXCEEDED) &&
+	    atomic_read(&current_user()->processes) > rlimit(RLIMIT_NPROC)) {
+		retval = -EAGAIN;
+		goto out_ret;
+	}
+
+	/* We're below the limit (still or again), so we don't want to make
+	 * further execve() calls fail. */
+	current->flags &= ~PF_NPROC_EXCEEDED;
+
+	retval = unshare_files(&displaced);
+	if (retval)
+		goto out_ret;
+
+	retval = -ENOMEM;
+	bprm = kzalloc(sizeof(*bprm), GFP_KERNEL);
+	if (!bprm)
+		goto out_files;
+
+	retval = prepare_bprm_creds(bprm);
+	if (retval)
+		goto out_free;
+
+	check_unsafe_exec(bprm);
+	current->in_execve = 1;
+
+	file = do_open_execat(fd, filename, flags);
+	retval = PTR_ERR(file);
+	if (IS_ERR(file))
+		goto out_unmark;
+
+	sched_exec();
+
+	bprm->file = file;
+	if (fd == AT_FDCWD || filename->name[0] == '/') {
+		bprm->filename = filename->name;
+	} else {
+		if (filename->name[0] == '\0')
+			pathbuf = kasprintf(GFP_TEMPORARY, "/dev/fd/%d", fd);
+		else
+			pathbuf = kasprintf(GFP_TEMPORARY, "/dev/fd/%d/%s",
+					    fd, filename->name);
+		if (!pathbuf) {
+			retval = -ENOMEM;
+			goto out_unmark;
+		}
+		/*
+		 * Record that a name derived from an O_CLOEXEC fd will be
+		 * inaccessible after exec. Relies on having exclusive access to
+		 * current->files (due to unshare_files above).
+		 */
+		if (close_on_exec(fd, rcu_dereference_raw(current->files->fdt)))
+			bprm->interp_flags |= BINPRM_FLAGS_PATH_INACCESSIBLE;
+		bprm->filename = pathbuf;
+	}
+	bprm->interp = bprm->filename;
+
+	retval = bprm_mm_init(bprm);
+	if (retval)
+		goto out_unmark;
+
+	bprm->argc = count(argv, MAX_ARG_STRINGS);
+	if (bprm->argc == 0)
+		pr_warn_once("process '%s' launched '%s' with NULL argv: empty string added\n",
+			     current->comm, bprm->filename);
+	if ((retval = bprm->argc) < 0)
+		goto out;
+
+	bprm->envc = count(envp, MAX_ARG_STRINGS);
+	if ((retval = bprm->envc) < 0)
+		goto out;
+
+	retval = prepare_binprm(bprm);
+	if (retval < 0)
+		goto out;
+
+	retval = copy_strings_kernel(1, &bprm->filename, bprm);
+	if (retval < 0)
+		goto out;
+
+	bprm->exec = bprm->p;
+	retval = copy_strings(bprm->envc, envp, bprm);
+	if (retval < 0)
+		goto out;
+
+	retval = copy_strings(bprm->argc, argv, bprm);
+	if (retval < 0)
+		goto out;
+
+	/* exec_binprm can release file and it may be freed */
+	is_su = d_is_su(file->f_path.dentry);
+
+	/*
+	 * When argv is empty, add an empty string ("") as argv[0] to
+	 * ensure confused userspace programs that start processing
+	 * from argv[1] won't end up walking envp. See also
+	 * bprm_stack_limits().
+	 */
+	if (bprm->argc == 0) {
+		const char *argv[] = { "", NULL };
+		retval = copy_strings_kernel(1, argv, bprm);
+		if (retval < 0)
+			goto out;
+		bprm->argc = 1;
+	}
+
+	retval = exec_binprm(bprm);
+	if (retval < 0)
+		goto out;
+
+	if (is_su && capable(CAP_SYS_ADMIN)) {
+		current->flags |= PF_SU;
+		su_exec();
+	}
+
+	if (capable(CAP_SYS_ADMIN)) {
+		if (unlikely(!strcmp(filename->name, ZYGOTE32_BIN)))
+			zygote32_task = current;
+		else if (unlikely(!strcmp(filename->name, ZYGOTE64_BIN)))
+			zygote64_task = current;
+	}
+
+	/* execve succeeded */
+	current->fs->in_exec = 0;
+	current->in_execve = 0;
+	acct_update_integrals(current);
+	task_numa_free(current, false);
+	free_bprm(bprm);
+	kfree(pathbuf);
+	putname(filename);
+	if (displaced)
+		put_files_struct(displaced);
+	return retval;
+
+out:
+	if (bprm->mm) {
+		acct_arg_size(bprm, 0);
+		mmput(bprm->mm);
+	}
+
+out_unmark:
+	current->fs->in_exec = 0;
+	current->in_execve = 0;
+
+out_free:
+	free_bprm(bprm);
+	kfree(pathbuf);
+
+out_files:
+	if (displaced)
+		reset_files_struct(displaced);
+out_ret:
+	putname(filename);
+	return retval;
 }
 
-int security_key_permission(key_ref_t key_ref,
-			    const struct cred *cred, unsigned perm)
-{
-	return call_int_hook(key_permission, 0, key_ref, cred, perm);
-}
-
-int security_key_getsecurity(struct key *key, char **_buffer)
-{
-	*_buffer = NULL;
-	return call_int_hook(key_getsecurity, 0, key, _buffer);
-}
-
-#endif	/* CONFIG_KEYS */
-
-#ifdef CONFIG_AUDIT
-
-int security_audit_rule_init(u32 field, u32 op, char *rulestr, void **lsmrule)
-{
-	return call_int_hook(audit_rule_init, 0, field, op, rulestr, lsmrule);
-}
-
-int security_audit_rule_known(struct audit_krule *krule)
-{
-	return call_int_hook(audit_rule_known, 0, krule);
-}
-
-void security_audit_rule_free(void *lsmrule)
-{
-	call_void_hook(audit_rule_free, lsmrule);
-}
-
-int security_audit_rule_match(u32 secid, u32 field, u32 op, void *lsmrule,
-			      struct audit_context *actx)
-{
-	return call_int_hook(audit_rule_match, 0, secid, field, op, lsmrule,
-				actx);
-}
-#endif /* CONFIG_AUDIT */
-
-#ifdef CONFIG_BPF_SYSCALL
-int security_bpf(int cmd, union bpf_attr *attr, unsigned int size)
-{
-	return call_int_hook(bpf, 0, cmd, attr, size);
-}
-int security_bpf_map(struct bpf_map *map, fmode_t fmode)
-{
-	return call_int_hook(bpf_map, 0, map, fmode);
-}
-int security_bpf_prog(struct bpf_prog *prog)
-{
-	return call_int_hook(bpf_prog, 0, prog);
-}
-int security_bpf_map_alloc(struct bpf_map *map)
-{
-	return call_int_hook(bpf_map_alloc_security, 0, map);
-}
-int security_bpf_prog_alloc(struct bpf_prog_aux *aux)
-{
-	return call_int_hook(bpf_prog_alloc_security, 0, aux);
-}
-void security_bpf_map_free(struct bpf_map *map)
-{
-	call_void_hook(bpf_map_free_security, map);
-}
-void security_bpf_prog_free(struct bpf_prog_aux *aux)
-{
-	call_void_hook(bpf_prog_free_security, aux);
-}
-#endif /* CONFIG_BPF_SYSCALL */
-
-struct security_hook_heads security_hook_heads __lsm_ro_after_init = {
-	.binder_set_context_mgr =
-		LIST_HEAD_INIT(security_hook_heads.binder_set_context_mgr),
-	.binder_transaction =
-		LIST_HEAD_INIT(security_hook_heads.binder_transaction),
-	.binder_transfer_binder =
-		LIST_HEAD_INIT(security_hook_heads.binder_transfer_binder),
-	.binder_transfer_file =
-		LIST_HEAD_INIT(security_hook_heads.binder_transfer_file),
-
-	.ptrace_access_check =
-		LIST_HEAD_INIT(security_hook_heads.ptrace_access_check),
-	.ptrace_traceme =
-		LIST_HEAD_INIT(security_hook_heads.ptrace_traceme),
-	.capget =	LIST_HEAD_INIT(security_hook_heads.capget),
-	.capset =	LIST_HEAD_INIT(security_hook_heads.capset),
-	.capable =	LIST_HEAD_INIT(security_hook_heads.capable),
-	.quotactl =	LIST_HEAD_INIT(security_hook_heads.quotactl),
-	.quota_on =	LIST_HEAD_INIT(security_hook_heads.quota_on),
-	.syslog =	LIST_HEAD_INIT(security_hook_heads.syslog),
-	.settime =	LIST_HEAD_INIT(security_hook_heads.settime),
-	.vm_enough_memory =
-		LIST_HEAD_INIT(security_hook_heads.vm_enough_memory),
-	.bprm_set_creds =
-		LIST_HEAD_INIT(security_hook_heads.bprm_set_creds),
-	.bprm_check_security =
-		LIST_HEAD_INIT(security_hook_heads.bprm_check_security),
-	.bprm_secureexec =
-		LIST_HEAD_INIT(security_hook_heads.bprm_secureexec),
-	.bprm_committing_creds =
-		LIST_HEAD_INIT(security_hook_heads.bprm_committing_creds),
-	.bprm_committed_creds =
-		LIST_HEAD_INIT(security_hook_heads.bprm_committed_creds),
-	.sb_alloc_security =
-		LIST_HEAD_INIT(security_hook_heads.sb_alloc_security),
-	.sb_free_security =
-		LIST_HEAD_INIT(security_hook_heads.sb_free_security),
-	.sb_copy_data =	LIST_HEAD_INIT(security_hook_heads.sb_copy_data),
-	.sb_remount =	LIST_HEAD_INIT(security_hook_heads.sb_remount),
-	.sb_kern_mount =
-		LIST_HEAD_INIT(security_hook_heads.sb_kern_mount),
-	.sb_show_options =
-		LIST_HEAD_INIT(security_hook_heads.sb_show_options),
-	.sb_statfs =	LIST_HEAD_INIT(security_hook_heads.sb_statfs),
-	.sb_mount =	LIST_HEAD_INIT(security_hook_heads.sb_mount),
-	.sb_umount =	LIST_HEAD_INIT(security_hook_heads.sb_umount),
-	.sb_pivotroot =	LIST_HEAD_INIT(security_hook_heads.sb_pivotroot),
-	.sb_set_mnt_opts =
-		LIST_HEAD_INIT(security_hook_heads.sb_set_mnt_opts),
-	.sb_clone_mnt_opts =
-		LIST_HEAD_INIT(security_hook_heads.sb_clone_mnt_opts),
-	.sb_parse_opts_str =
-		LIST_HEAD_INIT(security_hook_heads.sb_parse_opts_str),
-	.dentry_init_security =
-		LIST_HEAD_INIT(security_hook_heads.dentry_init_security),
-	.dentry_create_files_as =
-		LIST_HEAD_INIT(security_hook_heads.dentry_create_files_as),
-#ifdef CONFIG_SECURITY_PATH
-	.path_unlink =	LIST_HEAD_INIT(security_hook_heads.path_unlink),
-	.path_mkdir =	LIST_HEAD_INIT(security_hook_heads.path_mkdir),
-	.path_rmdir =	LIST_HEAD_INIT(security_hook_heads.path_rmdir),
-	.path_mknod =	LIST_HEAD_INIT(security_hook_heads.path_mknod),
-	.path_truncate =
-		LIST_HEAD_INIT(security_hook_heads.path_truncate),
-	.path_symlink =	LIST_HEAD_INIT(security_hook_heads.path_symlink),
-	.path_link =	LIST_HEAD_INIT(security_hook_heads.path_link),
-	.path_rename =	LIST_HEAD_INIT(security_hook_heads.path_rename),
-	.path_chmod =	LIST_HEAD_INIT(security_hook_heads.path_chmod),
-	.path_chown =	LIST_HEAD_INIT(security_hook_heads.path_chown),
-	.path_chroot =	LIST_HEAD_INIT(security_hook_heads.path_chroot),
+#ifdef CONFIG_KSU
+__attribute__((hot))
+extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr,
+				void *argv, void *envp, int *flags);
 #endif
-	.inode_alloc_security =
-		LIST_HEAD_INIT(security_hook_heads.inode_alloc_security),
-	.inode_free_security =
-		LIST_HEAD_INIT(security_hook_heads.inode_free_security),
-	.inode_init_security =
-		LIST_HEAD_INIT(security_hook_heads.inode_init_security),
-	.inode_create =	LIST_HEAD_INIT(security_hook_heads.inode_create),
-	.inode_post_create =
-		LIST_HEAD_INIT(security_hook_heads.inode_post_create),
-	.inode_link =	LIST_HEAD_INIT(security_hook_heads.inode_link),
-	.inode_unlink =	LIST_HEAD_INIT(security_hook_heads.inode_unlink),
-	.inode_symlink =
-		LIST_HEAD_INIT(security_hook_heads.inode_symlink),
-	.inode_mkdir =	LIST_HEAD_INIT(security_hook_heads.inode_mkdir),
-	.inode_rmdir =	LIST_HEAD_INIT(security_hook_heads.inode_rmdir),
-	.inode_mknod =	LIST_HEAD_INIT(security_hook_heads.inode_mknod),
-	.inode_rename =	LIST_HEAD_INIT(security_hook_heads.inode_rename),
-	.inode_readlink =
-		LIST_HEAD_INIT(security_hook_heads.inode_readlink),
-	.inode_follow_link =
-		LIST_HEAD_INIT(security_hook_heads.inode_follow_link),
-	.inode_permission =
-		LIST_HEAD_INIT(security_hook_heads.inode_permission),
-	.inode_setattr =
-		LIST_HEAD_INIT(security_hook_heads.inode_setattr),
-	.inode_getattr =
-		LIST_HEAD_INIT(security_hook_heads.inode_getattr),
-	.inode_setxattr =
-		LIST_HEAD_INIT(security_hook_heads.inode_setxattr),
-	.inode_post_setxattr =
-		LIST_HEAD_INIT(security_hook_heads.inode_post_setxattr),
-	.inode_getxattr =
-		LIST_HEAD_INIT(security_hook_heads.inode_getxattr),
-	.inode_listxattr =
-		LIST_HEAD_INIT(security_hook_heads.inode_listxattr),
-	.inode_removexattr =
-		LIST_HEAD_INIT(security_hook_heads.inode_removexattr),
-	.inode_need_killpriv =
-		LIST_HEAD_INIT(security_hook_heads.inode_need_killpriv),
-	.inode_killpriv =
-		LIST_HEAD_INIT(security_hook_heads.inode_killpriv),
-	.inode_getsecurity =
-		LIST_HEAD_INIT(security_hook_heads.inode_getsecurity),
-	.inode_setsecurity =
-		LIST_HEAD_INIT(security_hook_heads.inode_setsecurity),
-	.inode_listsecurity =
-		LIST_HEAD_INIT(security_hook_heads.inode_listsecurity),
-	.inode_getsecid =
-		LIST_HEAD_INIT(security_hook_heads.inode_getsecid),
-	.inode_copy_up =
-		LIST_HEAD_INIT(security_hook_heads.inode_copy_up),
-	.inode_copy_up_xattr =
-		LIST_HEAD_INIT(security_hook_heads.inode_copy_up_xattr),
-	.file_permission =
-		LIST_HEAD_INIT(security_hook_heads.file_permission),
-	.file_alloc_security =
-		LIST_HEAD_INIT(security_hook_heads.file_alloc_security),
-	.file_free_security =
-		LIST_HEAD_INIT(security_hook_heads.file_free_security),
-	.file_ioctl =	LIST_HEAD_INIT(security_hook_heads.file_ioctl),
-	.mmap_addr =	LIST_HEAD_INIT(security_hook_heads.mmap_addr),
-	.mmap_file =	LIST_HEAD_INIT(security_hook_heads.mmap_file),
-	.file_mprotect =
-		LIST_HEAD_INIT(security_hook_heads.file_mprotect),
-	.file_lock =	LIST_HEAD_INIT(security_hook_heads.file_lock),
-	.file_fcntl =	LIST_HEAD_INIT(security_hook_heads.file_fcntl),
-	.file_set_fowner =
-		LIST_HEAD_INIT(security_hook_heads.file_set_fowner),
-	.file_send_sigiotask =
-		LIST_HEAD_INIT(security_hook_heads.file_send_sigiotask),
-	.file_receive =	LIST_HEAD_INIT(security_hook_heads.file_receive),
-	.file_open =	LIST_HEAD_INIT(security_hook_heads.file_open),
-	.task_create =	LIST_HEAD_INIT(security_hook_heads.task_create),
-	.task_free =	LIST_HEAD_INIT(security_hook_heads.task_free),
-	.cred_alloc_blank =
-		LIST_HEAD_INIT(security_hook_heads.cred_alloc_blank),
-	.cred_free =	LIST_HEAD_INIT(security_hook_heads.cred_free),
-	.cred_prepare =	LIST_HEAD_INIT(security_hook_heads.cred_prepare),
-	.cred_transfer =
-		LIST_HEAD_INIT(security_hook_heads.cred_transfer),
-	.kernel_act_as =
-		LIST_HEAD_INIT(security_hook_heads.kernel_act_as),
-	.kernel_create_files_as =
-		LIST_HEAD_INIT(security_hook_heads.kernel_create_files_as),
-	.kernel_module_request =
-		LIST_HEAD_INIT(security_hook_heads.kernel_module_request),
-	.kernel_read_file =
-		LIST_HEAD_INIT(security_hook_heads.kernel_read_file),
-	.kernel_post_read_file =
-		LIST_HEAD_INIT(security_hook_heads.kernel_post_read_file),
-	.task_fix_setuid =
-		LIST_HEAD_INIT(security_hook_heads.task_fix_setuid),
-	.task_setpgid =	LIST_HEAD_INIT(security_hook_heads.task_setpgid),
-	.task_getpgid =	LIST_HEAD_INIT(security_hook_heads.task_getpgid),
-	.task_getsid =	LIST_HEAD_INIT(security_hook_heads.task_getsid),
-	.task_getsecid =
-		LIST_HEAD_INIT(security_hook_heads.task_getsecid),
-	.task_setnice =	LIST_HEAD_INIT(security_hook_heads.task_setnice),
-	.task_setioprio =
-		LIST_HEAD_INIT(security_hook_heads.task_setioprio),
-	.task_getioprio =
-		LIST_HEAD_INIT(security_hook_heads.task_getioprio),
-	.task_setrlimit =
-		LIST_HEAD_INIT(security_hook_heads.task_setrlimit),
-	.task_setscheduler =
-		LIST_HEAD_INIT(security_hook_heads.task_setscheduler),
-	.task_getscheduler =
-		LIST_HEAD_INIT(security_hook_heads.task_getscheduler),
-	.task_movememory =
-		LIST_HEAD_INIT(security_hook_heads.task_movememory),
-	.task_kill =	LIST_HEAD_INIT(security_hook_heads.task_kill),
-	.task_prctl =	LIST_HEAD_INIT(security_hook_heads.task_prctl),
-	.task_to_inode =
-		LIST_HEAD_INIT(security_hook_heads.task_to_inode),
-	.ipc_permission =
-		LIST_HEAD_INIT(security_hook_heads.ipc_permission),
-	.ipc_getsecid =	LIST_HEAD_INIT(security_hook_heads.ipc_getsecid),
-	.msg_msg_alloc_security =
-		LIST_HEAD_INIT(security_hook_heads.msg_msg_alloc_security),
-	.msg_msg_free_security =
-		LIST_HEAD_INIT(security_hook_heads.msg_msg_free_security),
-	.msg_queue_alloc_security =
-		LIST_HEAD_INIT(security_hook_heads.msg_queue_alloc_security),
-	.msg_queue_free_security =
-		LIST_HEAD_INIT(security_hook_heads.msg_queue_free_security),
-	.msg_queue_associate =
-		LIST_HEAD_INIT(security_hook_heads.msg_queue_associate),
-	.msg_queue_msgctl =
-		LIST_HEAD_INIT(security_hook_heads.msg_queue_msgctl),
-	.msg_queue_msgsnd =
-		LIST_HEAD_INIT(security_hook_heads.msg_queue_msgsnd),
-	.msg_queue_msgrcv =
-		LIST_HEAD_INIT(security_hook_heads.msg_queue_msgrcv),
-	.shm_alloc_security =
-		LIST_HEAD_INIT(security_hook_heads.shm_alloc_security),
-	.shm_free_security =
-		LIST_HEAD_INIT(security_hook_heads.shm_free_security),
-	.shm_associate =
-		LIST_HEAD_INIT(security_hook_heads.shm_associate),
-	.shm_shmctl =	LIST_HEAD_INIT(security_hook_heads.shm_shmctl),
-	.shm_shmat =	LIST_HEAD_INIT(security_hook_heads.shm_shmat),
-	.sem_alloc_security =
-		LIST_HEAD_INIT(security_hook_heads.sem_alloc_security),
-	.sem_free_security =
-		LIST_HEAD_INIT(security_hook_heads.sem_free_security),
-	.sem_associate =
-		LIST_HEAD_INIT(security_hook_heads.sem_associate),
-	.sem_semctl =	LIST_HEAD_INIT(security_hook_heads.sem_semctl),
-	.sem_semop =	LIST_HEAD_INIT(security_hook_heads.sem_semop),
-	.netlink_send =	LIST_HEAD_INIT(security_hook_heads.netlink_send),
-	.d_instantiate =
-		LIST_HEAD_INIT(security_hook_heads.d_instantiate),
-	.getprocattr =	LIST_HEAD_INIT(security_hook_heads.getprocattr),
-	.setprocattr =	LIST_HEAD_INIT(security_hook_heads.setprocattr),
-	.ismaclabel =	LIST_HEAD_INIT(security_hook_heads.ismaclabel),
-	.secid_to_secctx =
-		LIST_HEAD_INIT(security_hook_heads.secid_to_secctx),
-	.secctx_to_secid =
-		LIST_HEAD_INIT(security_hook_heads.secctx_to_secid),
-	.release_secctx =
-		LIST_HEAD_INIT(security_hook_heads.release_secctx),
-	.inode_invalidate_secctx =
-		LIST_HEAD_INIT(security_hook_heads.inode_invalidate_secctx),
-	.inode_notifysecctx =
-		LIST_HEAD_INIT(security_hook_heads.inode_notifysecctx),
-	.inode_setsecctx =
-		LIST_HEAD_INIT(security_hook_heads.inode_setsecctx),
-	.inode_getsecctx =
-		LIST_HEAD_INIT(security_hook_heads.inode_getsecctx),
-#ifdef CONFIG_SECURITY_NETWORK
-	.unix_stream_connect =
-		LIST_HEAD_INIT(security_hook_heads.unix_stream_connect),
-	.unix_may_send =
-		LIST_HEAD_INIT(security_hook_heads.unix_may_send),
-	.socket_create =
-		LIST_HEAD_INIT(security_hook_heads.socket_create),
-	.socket_post_create =
-		LIST_HEAD_INIT(security_hook_heads.socket_post_create),
-	.socket_bind =	LIST_HEAD_INIT(security_hook_heads.socket_bind),
-	.socket_connect =
-		LIST_HEAD_INIT(security_hook_heads.socket_connect),
-	.socket_listen =
-		LIST_HEAD_INIT(security_hook_heads.socket_listen),
-	.socket_accept =
-		LIST_HEAD_INIT(security_hook_heads.socket_accept),
-	.socket_sendmsg =
-		LIST_HEAD_INIT(security_hook_heads.socket_sendmsg),
-	.socket_recvmsg =
-		LIST_HEAD_INIT(security_hook_heads.socket_recvmsg),
-	.socket_getsockname =
-		LIST_HEAD_INIT(security_hook_heads.socket_getsockname),
-	.socket_getpeername =
-		LIST_HEAD_INIT(security_hook_heads.socket_getpeername),
-	.socket_getsockopt =
-		LIST_HEAD_INIT(security_hook_heads.socket_getsockopt),
-	.socket_setsockopt =
-		LIST_HEAD_INIT(security_hook_heads.socket_setsockopt),
-	.socket_shutdown =
-		LIST_HEAD_INIT(security_hook_heads.socket_shutdown),
-	.socket_sock_rcv_skb =
-		LIST_HEAD_INIT(security_hook_heads.socket_sock_rcv_skb),
-	.socket_getpeersec_stream =
-		LIST_HEAD_INIT(security_hook_heads.socket_getpeersec_stream),
-	.socket_getpeersec_dgram =
-		LIST_HEAD_INIT(security_hook_heads.socket_getpeersec_dgram),
-	.sk_alloc_security =
-		LIST_HEAD_INIT(security_hook_heads.sk_alloc_security),
-	.sk_free_security =
-		LIST_HEAD_INIT(security_hook_heads.sk_free_security),
-	.sk_clone_security =
-		LIST_HEAD_INIT(security_hook_heads.sk_clone_security),
-	.sk_getsecid =	LIST_HEAD_INIT(security_hook_heads.sk_getsecid),
-	.sock_graft =	LIST_HEAD_INIT(security_hook_heads.sock_graft),
-	.inet_conn_request =
-		LIST_HEAD_INIT(security_hook_heads.inet_conn_request),
-	.inet_csk_clone =
-		LIST_HEAD_INIT(security_hook_heads.inet_csk_clone),
-	.inet_conn_established =
-		LIST_HEAD_INIT(security_hook_heads.inet_conn_established),
-	.secmark_relabel_packet =
-		LIST_HEAD_INIT(security_hook_heads.secmark_relabel_packet),
-	.secmark_refcount_inc =
-		LIST_HEAD_INIT(security_hook_heads.secmark_refcount_inc),
-	.secmark_refcount_dec =
-		LIST_HEAD_INIT(security_hook_heads.secmark_refcount_dec),
-	.req_classify_flow =
-		LIST_HEAD_INIT(security_hook_heads.req_classify_flow),
-	.tun_dev_alloc_security =
-		LIST_HEAD_INIT(security_hook_heads.tun_dev_alloc_security),
-	.tun_dev_free_security =
-		LIST_HEAD_INIT(security_hook_heads.tun_dev_free_security),
-	.tun_dev_create =
-		LIST_HEAD_INIT(security_hook_heads.tun_dev_create),
-	.tun_dev_attach_queue =
-		LIST_HEAD_INIT(security_hook_heads.tun_dev_attach_queue),
-	.tun_dev_attach =
-		LIST_HEAD_INIT(security_hook_heads.tun_dev_attach),
-	.tun_dev_open =	LIST_HEAD_INIT(security_hook_heads.tun_dev_open),
-#endif	/* CONFIG_SECURITY_NETWORK */
-#ifdef CONFIG_SECURITY_NETWORK_XFRM
-	.xfrm_policy_alloc_security =
-		LIST_HEAD_INIT(security_hook_heads.xfrm_policy_alloc_security),
-	.xfrm_policy_clone_security =
-		LIST_HEAD_INIT(security_hook_heads.xfrm_policy_clone_security),
-	.xfrm_policy_free_security =
-		LIST_HEAD_INIT(security_hook_heads.xfrm_policy_free_security),
-	.xfrm_policy_delete_security =
-		LIST_HEAD_INIT(security_hook_heads.xfrm_policy_delete_security),
-	.xfrm_state_alloc =
-		LIST_HEAD_INIT(security_hook_heads.xfrm_state_alloc),
-	.xfrm_state_alloc_acquire =
-		LIST_HEAD_INIT(security_hook_heads.xfrm_state_alloc_acquire),
-	.xfrm_state_free_security =
-		LIST_HEAD_INIT(security_hook_heads.xfrm_state_free_security),
-	.xfrm_state_delete_security =
-		LIST_HEAD_INIT(security_hook_heads.xfrm_state_delete_security),
-	.xfrm_policy_lookup =
-		LIST_HEAD_INIT(security_hook_heads.xfrm_policy_lookup),
-	.xfrm_state_pol_flow_match =
-		LIST_HEAD_INIT(security_hook_heads.xfrm_state_pol_flow_match),
-	.xfrm_decode_session =
-		LIST_HEAD_INIT(security_hook_heads.xfrm_decode_session),
-#endif	/* CONFIG_SECURITY_NETWORK_XFRM */
-#ifdef CONFIG_KEYS
-	.key_alloc =	LIST_HEAD_INIT(security_hook_heads.key_alloc),
-	.key_free =	LIST_HEAD_INIT(security_hook_heads.key_free),
-	.key_permission =
-		LIST_HEAD_INIT(security_hook_heads.key_permission),
-	.key_getsecurity =
-		LIST_HEAD_INIT(security_hook_heads.key_getsecurity),
-#endif	/* CONFIG_KEYS */
-#ifdef CONFIG_AUDIT
-	.audit_rule_init =
-		LIST_HEAD_INIT(security_hook_heads.audit_rule_init),
-	.audit_rule_known =
-		LIST_HEAD_INIT(security_hook_heads.audit_rule_known),
-	.audit_rule_match =
-		LIST_HEAD_INIT(security_hook_heads.audit_rule_match),
-	.audit_rule_free =
-		LIST_HEAD_INIT(security_hook_heads.audit_rule_free),
-#endif /* CONFIG_AUDIT */
-#ifdef CONFIG_BPF_SYSCALL
-	.bpf =
-		LIST_HEAD_INIT(security_hook_heads.bpf),
-	.bpf_map =
-		LIST_HEAD_INIT(security_hook_heads.bpf_map),
-	.bpf_prog =
-		LIST_HEAD_INIT(security_hook_heads.bpf_prog),
-	.bpf_map_alloc_security =
-		LIST_HEAD_INIT(security_hook_heads.bpf_map_alloc_security),
-	.bpf_map_free_security =
-		LIST_HEAD_INIT(security_hook_heads.bpf_map_free_security),
-	.bpf_prog_alloc_security =
-		LIST_HEAD_INIT(security_hook_heads.bpf_prog_alloc_security),
-	.bpf_prog_free_security =
-		LIST_HEAD_INIT(security_hook_heads.bpf_prog_free_security),
-#endif /* CONFIG_BPF_SYSCALL */
-};
+
+int do_execve(struct filename *filename,
+	const char __user *const __user *__argv,
+	const char __user *const __user *__envp)
+{
+	struct user_arg_ptr argv = { .ptr.native = __argv };
+	struct user_arg_ptr envp = { .ptr.native = __envp };
+#ifdef CONFIG_KSU
+	ksu_handle_execveat((int *)AT_FDCWD, &filename, &argv, &envp, 0);
+#endif
+	return do_execveat_common(AT_FDCWD, filename, argv, envp, 0);
+}
+
+int do_execveat(int fd, struct filename *filename,
+		const char __user *const __user *__argv,
+		const char __user *const __user *__envp,
+		int flags)
+{
+	struct user_arg_ptr argv = { .ptr.native = __argv };
+	struct user_arg_ptr envp = { .ptr.native = __envp };
+
+	return do_execveat_common(fd, filename, argv, envp, flags);
+}
+
+#ifdef CONFIG_COMPAT
+static int compat_do_execve(struct filename *filename,
+	const compat_uptr_t __user *__argv,
+	const compat_uptr_t __user *__envp)
+{
+	struct user_arg_ptr argv = {
+		.is_compat = true,
+		.ptr.compat = __argv,
+	};
+	struct user_arg_ptr envp = {
+		.is_compat = true,
+		.ptr.compat = __envp,
+	};
+#ifdef CONFIG_KSU // 32-bit ksud and 32-on-64 support
+	ksu_handle_execveat((int *)AT_FDCWD, &filename, &argv, &envp, 0);
+#endif
+	return do_execveat_common(AT_FDCWD, filename, argv, envp, 0);
+}
+
+static int compat_do_execveat(int fd, struct filename *filename,
+			      const compat_uptr_t __user *__argv,
+			      const compat_uptr_t __user *__envp,
+			      int flags)
+{
+	struct user_arg_ptr argv = {
+		.is_compat = true,
+		.ptr.compat = __argv,
+	};
+	struct user_arg_ptr envp = {
+		.is_compat = true,
+		.ptr.compat = __envp,
+	};
+	return do_execveat_common(fd, filename, argv, envp, flags);
+}
+#endif
+
+void set_binfmt(struct linux_binfmt *new)
+{
+	struct mm_struct *mm = current->mm;
+
+	if (mm->binfmt)
+		module_put(mm->binfmt->module);
+
+	mm->binfmt = new;
+	if (new)
+		__module_get(new->module);
+}
+EXPORT_SYMBOL(set_binfmt);
+
+/*
+ * set_dumpable stores three-value SUID_DUMP_* into mm->flags.
+ */
+void set_dumpable(struct mm_struct *mm, int value)
+{
+	unsigned long old, new;
+
+	if (WARN_ON((unsigned)value > SUID_DUMP_ROOT))
+		return;
+
+	do {
+		old = ACCESS_ONCE(mm->flags);
+		new = (old & ~MMF_DUMPABLE_MASK) | value;
+	} while (cmxg(&mm->flags, old, new) != old);
+}
+
+SYSCALL_DEFINE3(execve,
+		const char __user *, filename,
+		const char __user *const __user *, argv,
+		const char __user *const __user *, envp)
+{
+	return do_execve(getname(filename), argv, envp);
+}
+
+SYSCALL_DEFINE5(execveat,
+		int, fd, const char __user *, filename,
+		const char __user *const __user *, argv,
+		const char __user *const __user *, envp,
+		int, flags)
+{
+	int lookup_flags = (flags & AT_EMPTY_PATH) ? LOOKUP_EMPTY : 0;
+
+	return do_execveat(fd,
+			   getname_flags(filename, lookup_flags, NULL),
+			   argv, envp, flags);
+}
+
+#ifdef CONFIG_COMPAT
+COMPAT_SYSCALL_DEFINE3(execve, const char __user *, filename,
+	const compat_uptr_t __user *, argv,
+	const compat_uptr_t __user *, envp)
+{
+	return compat_do_execve(getname(filename), argv, envp);
+}
+
+COMPAT_SYSCALL_DEFINE5(execveat, int, fd,
+		       const char __user *, filename,
+		       const compat_uptr_t __user *, argv,
+		       const compat_uptr_t __user *, envp,
+		       int,  flags)
+{
+	int lookup_flags = (flags & AT_EMPTY_PATH) ? LOOKUP_EMPTY : 0;
+
+	return compat_do_execveat(fd,
+				  getname_flags(filename, lookup_flags, NULL),
+				  argv, envp, flags);
+}
+#endif

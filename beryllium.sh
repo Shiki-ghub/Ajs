@@ -10,7 +10,6 @@ KSU="Exclude"
 JOBS="24"
 CLANG_PATH_ARG=""
 DEFCONFIG="nogravity_defconfig"
-LOCALVERSION="-NGK-1"
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -45,6 +44,9 @@ export CROSS_COMPILE=aarch64-linux-gnu-
 export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
 export KBUILD_BUILD_USER=Pierre2324
 export KBUILD_BUILD_HOST=bokir
+export KBUILD_BUILD_TIMESTAMP="Sun, 27 Dec 2020 00:00:00 +0700"
+export SOURCE_DATE_EPOCH=1609002000
+
 
 echo
 echo "Set DEFCONFIG"

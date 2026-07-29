@@ -52,12 +52,12 @@ echo
 echo "Set DEFCONFIG"
 echo
 
-# Setup source driver KernelSU-Next (mode legacy = manual hook, cocok dengan
+# Setup source driver resuki (mode legacy = manual hook, cocok dengan
 # hook manual yang sudah dipatch di security.c/fs/exec.c/dll). Harus jalan
 # sebelum "make defconfig" karena nambah entry ke drivers/Kconfig & drivers/Makefile.
 # Setup KernelSU
 if [ "${KSU}" = "Include" ]; then
-    if ! curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s 065a36a; then
+    if ! curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash; then
         echo "KernelSU setup failed"
         exit 1
     fi
@@ -65,7 +65,7 @@ if [ "${KSU}" = "Include" ]; then
     echo "Downloading KSU defconfig..."
 
     if ! curl -fL \
-        https://raw.githubusercontent.com/Shiki-ghub/Ajs/main/nogravityksun_defconfig \
+        https://raw.githubusercontent.com/Shiki-ghub/Ajs/main/nogravityresuki_defconfig \
         -o arch/arm64/configs/${DEFCONFIG}; then
         echo "Failed to download KSU defconfig"
         exit 1

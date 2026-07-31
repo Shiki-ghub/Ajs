@@ -57,7 +57,7 @@ echo
 # sebelum "make defconfig" karena nambah entry ke drivers/Kconfig & drivers/Makefile.
 # Setup KernelSU
 if [ "${KSU}" = "Include" ]; then
-    if ! curl -LSs "https://raw.githubusercontent.com/sidex15/KernelSU-Next/legacy-susfs-v2/kernel/setup.sh" | bash -s legacy-susfs-v2; then
+    if ! curl -LSs "https://raw.githubusercontent.com/sidex15/KernelSU-Next/stable/kernel/setup.sh" | bash -s legacy-susfs-v2; then
         echo "KernelSU setup failed"
         exit 1
     fi

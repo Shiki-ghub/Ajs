@@ -66,7 +66,7 @@ if [ "${KSU}" = "Include" ]; then
     echo "Downloading KSU defconfig..."
 
     if ! curl -fL \
-        https://raw.githubusercontent.com/Shiki-ghub/Ajs/main/resukisu_droidspaces/nogravityresuki_droidspaces.defconfig \
+        https://raw.githubusercontent.com/Shiki-ghub/Ajs/main/resukisu_droidspaces/nogravityresuki_droidspaces_defconfig \
         -o arch/arm64/configs/${DEFCONFIG}; then
         echo "Failed to download KSU defconfig"
         exit 1

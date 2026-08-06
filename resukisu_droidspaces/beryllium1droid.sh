@@ -46,6 +46,7 @@ export KBUILD_BUILD_USER=Pierre2324
 export KBUILD_BUILD_HOST=bokir
 export KBUILD_BUILD_TIMESTAMP="Sun, 27 Dec 2020 18:30:00 +0700"
 export SOURCE_DATE_EPOCH=1609500600
+export KCFLAGS="-DKSU_HAS_PATH_UMOUNT"
 
 
 echo
@@ -81,6 +82,7 @@ make CC=clang \
     O=out \
     ARCH=${ARCH} \
     LOCALVERSION=${LOCALVERSION} \
+    KCFLAGS="${KCFLAGS}" \
     ${DEFCONFIG}
 
 # Toggle CONFIG_KSU sesuai input
@@ -98,6 +100,7 @@ make CC=clang \
     O=out \
     ARCH=${ARCH} \
     LOCALVERSION=${LOCALVERSION} \
+    KCFLAGS="${KCFLAGS}" \
     olddefconfig
 
 echo
@@ -109,7 +112,7 @@ cp arch/arm64/boot/dts/qcom/SE_NSE/${TOUCH_DTS}/* arch/arm64/boot/dts/qcom/
 echo
 echo "Build The Good Stuff"
 echo
-make CC=clang AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip O=out ARCH=${ARCH} LOCALVERSION=${LOCALVERSION} -j${JOBS}
+make CC=clang AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip O=out ARCH=${ARCH} LOCALVERSION=${LOCALVERSION} KCFLAGS="${KCFLAGS}" -j${JOBS}
 
 echo "Build succesful"
 

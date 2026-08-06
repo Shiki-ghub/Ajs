@@ -3841,7 +3841,7 @@ static int cgroup_add_file(struct cgroup_subsys_state *css, struct cgroup *cgrp,
 	if (IS_ERR(kn))
 		return PTR_ERR(kn);
 
-		ret = cgroup_kn_set_ugid(kn);
+	ret = cgroup_kn_set_ugid(kn);
 	if (ret) {
 		kernfs_remove(kn);
 		return ret;
